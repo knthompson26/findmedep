@@ -25,18 +25,19 @@ Analyses for this project were conducted in R (Version 4.0.3). Below names and l
 
 **Research Question 1:** How do prominent individual-level risk factors for depression contribute to concurrent and longitudinal symptom occurrence? 
 
-1. FINDME_missingE_dep_EREML.Rmd. Mixed linear models were conducted on 81 variables on three depression outcomes (W1A, W1B, W4). First, This is done as estimating one random effect for "environmental" data and one random effect for genetic data. Second, we estimate specific random effects for each domain. 
+1. FINDME_missingE_dep_EREML.Rmd. Mixed linear models were conducted on 81 variables on three depression outcomes (W1A, W1B, W4). First, This is done by estimating one random effect for "environmental" data and one random effect for genetic data. Second, we estimate specific random effects for each domain. 
                 
 ***
 
 **Research Question 2:** To what extent does the wider environment add to the explanation of depression symptoms?
 
-1. FINDME_missingE_dep_RQ2.Rmd. All CLPM and RI-CLPM run separately for mother and teacher report. Constraint testing for CLPM and RI-CLPM, separated by inattention, hyperactivity, and total ADHD models. 
+1. FINDME_missingE_dep_RQ2.Rmd. Mixed linear models were conducted on 162 variables on three depression outcomes (W1A, W1B, W4). This is done by estimating a random effect for each system: biological/genetic systems, psychological systems, social environment, the built environment, and the natural environment.  
 
 ***
 
 **Sensitivity analyses** 
 
-1. FINDME_missingE_dep_EREML.Rmd. Using multiple group RI-CLPM to assess measurement invariance in 4 steps. Step 1: the configural model, Step 2: weak factorial invariance, Step 3: strong factorial invariance, Step 4: the latent measurement model RI-CLPM. 
+1. FINDME_missingE_dep_EREML.Rmd. First, we calculated the heritability of all environmental factors and removed the top ten most heritable items from the environmental component, and reclaculated the G + E + G * E model.
+2. FINDME_missingE_dep_EREML.Rmd. Second, we removed all health-related variables from the environmental component to assess if mental or physical health factors were driving the variance explained, and recalucated the G + E + G * E model.
 
 ***
