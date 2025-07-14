@@ -1,0 +1,2915 @@
+---
+title: "Systems check: Research question 2 (FINDME)" 
+author: "K N Thompson"
+date: "2024-09-17"
+output:  
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: 2
+    toc_float:
+      collapsed: false
+    number_sections: false
+    highlight: monochrome
+    theme: flatly
+    code_folding: show
+    includes:
+      after_body: footer.html
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      comment = NA,
+                      prompt = FALSE,
+                      cache = FALSE,
+                      message = FALSE,
+                      warning = FALSE,
+                      results = 'markup')
+
+options(bitmapType = 'quartz') # to render fonts better
+```
+
+```{r Clear global environment, include=FALSE}
+remove(list = ls())
+```
+
+```{r Load packages, include=FALSE}
+library(knitr)
+library(haven)
+library(psych) 
+library(tidyr)
+library(lavaan)
+library(ggplot2)
+library(data.table)
+library(questionr) 
+library(viridis) # For a color-blind-friendly palette
+library(RColorBrewer) # For high-contrast color palettes
+library(tidyverse)
+library(dplyr) #conflicts with tidyverse for e.g. rename and row_number
+```
+
+# Matching IDs to RQ1
+
+**THIS IS FOR EUROPEAN ANCESTRY INDIVIDUALS ONLY**
+
+Only FID and AID cols are filled. 
+
+```{r read in matching IDs}
+ALL_matching_ids_nosibs <- read.table("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/matching_id_grm_erm.txt")
+colnames(ALL_matching_ids_nosibs) <- c("FID", "AID", "PID", "MID", "Sex", "Phenotype")
+ALL_matching_ids_nosibs <- ALL_matching_ids_nosibs %>% mutate(AID = as.character(AID), FID = as.character(FID))
+```
+
+# Functions
+
+```{r missingness}
+# replace ggsave 
+save_gg_cairo <- function(plot, filename, width = 900, height = 800) {
+  library(Cairo)
+  CairoPNG(filename, width = width, height = height)
+  print(plot)
+  if (!is.null(dev.list())) dev.off()
+}
+
+# function to identify variables with more than a specified number of NAs
+find_vars_with_na <- function(data, threshold) {
+  vars_with_na <- colSums(is.na(data))
+  vars_with_na_more_than_threshold <- names(vars_with_na[vars_with_na > threshold])
+  num_na <- vars_with_na[vars_with_na > threshold]
+  return(list(num_na))
+}
+
+threshold <- 500 # set threshold
+
+drop_individuals_na_over_percentage <- function(data, threshold_percentage) {
+  num_vars <- ncol(data)
+  threshold_count <- threshold_percentage / 100 * num_vars
+  na_counts <- rowSums(is.na(data))
+  data_filtered <- data[na_counts <= threshold_count, ]
+  return(data_filtered)
+}
+
+# Random imputation function
+random_sample_imputation <- function(x) {
+  missing <- is.na(x) # Identify missing values
+  x[missing] <- sample(x[!missing], size = sum(missing), replace = TRUE) # Draw the exact number of replacements
+  return(x)
+}
+
+# Function to create dummy variables for each categorical variable, excluding a reference category
+create_dummy_variables <- function(data, categorical_data, reference_category = NULL) {
+  numeric_vars <- names(categorical_data) # get names of categorical variables
+  for (var in numeric_vars) {
+    categories <- unique(data[[var]]) # Get unique categories
+    categories <- categories[!is.na(categories)] # Remove NA values
+    
+    # Only proceed if there are more than 2 categories
+    if (length(categories) > 2) {
+      # Define the reference category
+      ref_cat <- if (!is.null(reference_category[[var]])) {
+        reference_category[[var]]
+      } else {
+        categories[1]  # Default to the first category if no specific reference is provided
+      }
+      
+      # Exclude the reference category from dummy variable creation
+      for (cat in categories[categories != ref_cat]) {
+        data <- data %>%
+          mutate(!!paste0(var, "_dummy_", cat) := as.numeric(data[[var]] == cat))
+      }
+      
+      # Remove the original variable, only keep dummy variables
+      data <- data %>%
+        select(-all_of(var))
+    }
+  }
+  
+  return(data)
+}
+
+# likelihood ratio test
+LRT <- function(path_full, path_constrained, Outcome = NA, Comparison = NA, df) {
+  # Construct full paths
+  lines_full <- readLines(path_full)
+  lines_constrained <- readLines(path_constrained)
+  
+  # Find lines with "LKH"
+  line_full <- grep("LKH", lines_full, value = TRUE)
+  line_constrained <- grep("LKH", lines_constrained, value = TRUE)
+  
+  # Extract log-likelihoods
+  LKH_full <- as.numeric(strsplit(line_full, "\\s+")[[1]][3])
+  LKH_constrained <- as.numeric(strsplit(line_constrained, "\\s+")[[1]][3])
+  
+  # Likelihood Ratio Test
+  LRT <- -2 * (LKH_constrained - LKH_full)
+  pval <- pchisq(LRT, df = df, lower.tail = FALSE)
+  
+  interpretation <- ifelse(pval < 0.05,
+                           "Full model significantly improves fit",
+                           "No significant improvement from full model")
+  
+  # Create and return result tibble
+  tibble(
+    Outcome = Outcome,
+    Comparison = Comparison,
+    Type = "LRT",
+    Constrained_LKH = LKH_constrained,
+    Full_LKH = LKH_full,
+    Value = LRT,
+    P_value = pval,
+    Interpretation = interpretation
+  )
+}
+```
+
+```{r extract delta output function}
+extract_delta_output <- function(
+  outcome,
+  model_prefix,
+  path,
+  domain_labels = NULL,
+  return_split = FALSE,
+  domain_model = FALSE,
+  domain_filename = NULL
+) {
+  # ----- Determine the file path -----
+  file_path <- paste0(path, model_prefix, "_", outcome, ".out3")
+  if (!file.exists(file_path)) stop("File not found: ", file_path)
+  output_raw <- readLines(file_path)
+
+  # ----- Variance components -----
+  est_raw <- grep("Ratio:", output_raw, value = TRUE)
+  est_split <- strsplit(est_raw, "\\s+")
+  est_df <- do.call(rbind, lapply(est_split, function(x) {
+    data.frame(
+      parameter = "Variance",
+      domain = NA_character_,
+      variance_std = as.numeric(x[3]),
+      SE = as.numeric(x[5]),
+      P_value = as.numeric(x[7])
+    )
+  }))
+
+  # ----- Assign domain labels -----
+  if (!is.null(domain_labels)) {
+    if (length(domain_labels) == nrow(est_df)) {
+      est_df$domain <- domain_labels
+    } else {
+      warning("Length of domain_labels does not match number of components. Assigning generic names.")
+      est_df$domain <- paste0("Component_", seq_len(nrow(est_df)))
+    }
+  } else {
+    est_df$domain <- paste0("Component_", seq_len(nrow(est_df)))
+  }
+
+  # ----- Covariance contribution -----
+  cov_contribution <- NA
+  if (grepl("syst_cov", model_prefix)) {
+    domain_only_sum <- sum(est_df$variance_std, na.rm = TRUE)
+    cov_contribution <- 1 - domain_only_sum
+
+    cov_row <- data.frame(
+      parameter = "Covariance",
+      domain = "Covariance",
+      variance_std = cov_contribution,
+      SE = NA,
+      P_value = NA
+    )
+
+    est_df <- rbind(est_df, cov_row)
+  }
+
+  # ----- Correlation estimates -----
+  cor_df <- NULL
+  if (grepl("syst_cov", model_prefix) || domain_model) {
+    cor_raw <- grep("Cor  :", output_raw, value = TRUE)
+    if (length(cor_raw) > 0) {
+      cor_matrix <- do.call(rbind, lapply(cor_raw, function(line) {
+        parts <- strsplit(trimws(line), "\\s+")[[1]]
+        data.frame(
+          correlation_r = as.numeric(parts[3]),
+          SE = as.numeric(parts[5]),
+          P_value = as.numeric(parts[7])
+        )
+      }))
+
+      # Exclude interaction terms and error/covariance
+      domain_lower <- tolower(est_df$domain)
+      exclude_patterns <- c("interaction", "gxe", "covariance", "error")
+
+      correlatable_domains <- est_df$domain[!sapply(domain_lower, function(d) {
+        any(stringr::str_detect(d, paste0(exclude_patterns, collapse = "|")))
+      })]
+
+      domain_pairs <- combn(correlatable_domains, 2, simplify = FALSE)
+
+      if (length(domain_pairs) != nrow(cor_matrix)) {
+        warning("Number of correlations does not match number of domain pairs. ",
+                "Detected pairs: ", length(domain_pairs),
+                ", correlations in file: ", nrow(cor_matrix),
+                ". Truncating to match correlation rows.")
+        domain_pairs <- domain_pairs[seq_len(min(length(domain_pairs), nrow(cor_matrix)))]
+      }
+
+      cor_df_raw <- purrr::map2_dfr(domain_pairs, seq_along(domain_pairs), function(pair, i) {
+        var1 <- pair[1]
+        var2 <- pair[2]
+        rho <- cor_matrix$correlation_r[i]
+        se <- cor_matrix$SE[i]
+        pval <- cor_matrix$P_value[i]
+
+        var1_val <- est_df$variance_std[est_df$domain == var1]
+        var2_val <- est_df$variance_std[est_df$domain == var2]
+        cov_val <- rho * sqrt(var1_val * var2_val)
+        var_expl <- 2 * cov_val
+
+        data.frame(
+          parameter = paste0(var1, " ~ ", var2),
+          domain = "Correlation",
+          unscaled_variance = var_expl,
+          SE = round(se, 4),
+          P_value = round(pval, 4),
+          correlation_r = round(rho, 4)
+        )
+      })
+
+      total_covariance_est <- est_df$variance_std[est_df$domain == "Covariance"]
+
+      # Allow negative or zero covariance and still report unscaled correlation variance
+      scale_factor <- if (!is.na(total_covariance_est) && sum(cor_df_raw$unscaled_variance, na.rm = TRUE) != 0) {
+        total_covariance_est / sum(cor_df_raw$unscaled_variance, na.rm = TRUE)
+      } else {
+        warning("Covariance estimate is missing or 0; using unscaled correlation variances.")
+        1
+      }
+
+      cor_df <- cor_df_raw %>%
+        mutate(
+          variance_std = round(unscaled_variance * scale_factor, 4)
+        ) %>%
+        select(parameter, domain, variance_std, SE, P_value, correlation_r)
+    }
+  }
+
+  # ----- Combine all rows -----
+  if (!is.null(cor_df)) {
+    full_df <- bind_rows(est_df, cor_df)
+  } else {
+    est_df$correlation_r <- NA_real_
+    full_df <- est_df
+  }
+
+  # ----- Post-processing -----
+  full_df <- full_df %>%
+    group_by(model = model_prefix, outcome) %>%
+    mutate(
+      CI_lower = if_else(!is.na(SE), variance_std - 1.96 * SE, NA_real_),
+      CI_upper = if_else(!is.na(SE), variance_std + 1.96 * SE, NA_real_),
+      raw_total = sum(variance_std[parameter %in% c("Variance", "Covariance") & domain != "Error"], na.rm = TRUE),
+      variance_std_tot = if_else(parameter %in% c("Variance", "Covariance"), raw_total, NA_real_),
+      across(c(variance_std, SE, CI_lower, CI_upper, variance_std_tot, P_value), ~ round(.x, 4)),
+      input = case_when(
+        domain_model & grepl("syst_cov_gxe", model_prefix) ~ "Systems, rGE & GxE",
+        domain_model & grepl("syst_cov", model_prefix) ~ "Systems, rGE",
+        domain_model & grepl("syst_gxe", model_prefix) ~ "Systems, GxE",
+        domain_model & grepl("syst", model_prefix)     ~ "Systems",
+        TRUE                                           ~ "Other"
+      ),
+      flag_neg_variance = if_else(parameter %in% c("Variance", "Covariance") & variance_std < 0, TRUE, FALSE),
+      flag_corr_out_of_bounds = if_else(domain == "Correlation" & 
+                                          (!is.na(CI_lower) & (CI_lower < -1 | CI_upper > 1)), TRUE, FALSE)
+    ) %>%
+    select(-raw_total) %>%
+    ungroup() %>%
+    select(outcome, domain, input, variance_std, SE, CI_lower, CI_upper,
+           variance_std_tot, model, parameter, P_value,
+           flag_neg_variance, flag_corr_out_of_bounds, correlation_r)
+
+  # ----- Optional split return -----
+  if (return_split) {
+    list(
+      variance_table = full_df %>% filter(domain != "Correlation"),
+      correlation_table = full_df %>% filter(domain == "Correlation")
+    )
+  } else {
+    return(full_df)
+  }
+}
+```
+
+# Wave I 
+
+INHOME
+
+```{r load wave I inhome}
+inhome_raw <- read_xpt("/project/rche/data/datasets/addhealth/Core Files - Wave I/Wave I In Home Interview Data/allwave1.xpt")
+ncol(inhome_raw)
+nrow(inhome_raw)
+```
+
+```{r select variables}
+inhome <- inhome_raw %>%
+  select(AID,
+         # Covariates
+         BIO_SEX,                    # biological sex (binary: male=1/female=2)
+         H1GI1Y,                     # year of birth
+         # Psychological systems
+         ## general, mental, and physical health
+         H1GH1,        # general health (categorical ordered: excellent, very good, good, fair, poor)
+         H1PL1,        # permanent physical condition (binary: Yes=1, no=0)
+         H1GH2,        # frequency of headache - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH3,        # frequency of feeling hot - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH4,        # frequency of stomach ache - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH5,        # frequency of cold sweats - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH6,        # frequency of feeling weak - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH7,        # frequency of sore throat - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH8,        # frequency of fatigue - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH9,        # frequency of painful urination - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH10,       # frequency of feeling really sick - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH11,       # frequency of waking up tired - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH12,       # frequency of skin problems - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH13,       # frequency of dizziness - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH14,       # frequency of chest pains - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH15,       # frequency of aches and pains - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH16,       # frequency of period pains - past 12 months - (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH17,       # frequency of poor appetite - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH18,       # frequency of sleep problems - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH19,       # frequency of trouble relaxing - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH22,       # frequency of fearfulness - past 12 months (categorical ordered: Never, just a few times, once a week, almost every day, every day)
+         H1GH26,       # thought needed medical care but didn't seek it - past year (binary: Yes=1, No=0)
+         H1GH28,       # how think of yourself in weight (categorical ordered: 1=very underweight, slightly underweight, about right, slightly overweight, 5=very overweight)
+         H1GH29,       # trying to change weight (categorical: lose weight, gain weight, stay the same weight, not trying to do anything about weight)
+         H1HS3,        # psychological counselling in past year (binary: yes=1, no=0)
+         H1GH48,       # health or emotional problem caused day off school (categorical frequency: Never, a few times, once a week, almost every day, every day)
+         H1GH49,       # health or emotional problem caused miss recreational activity (categorical frequency: Never, a few times, once a week, almost every day, every day)
+         ## positive cognition 
+         H1PF33,       # you like yourself (categorical frequency: strongly agree, agree, neither agree or disagree, disagree, strongly disagree) - strange ordering 
+         H1PF34,       # you feel  you are doing everything just about right (categorical frequency: strongly agree, agree, neither agree or disagree, disagree, strongly disagree)
+         H1PF35,       # you feel socially accepted (categorical frequency: strongly agree, agree, neither agree or disagree, disagree, strongly disagree)
+         H1PF36,       # you feel loved and wanted (categorical frequency: strongly agree, agree, neither agree or disagree, disagree, strongly disagree)
+         ## additional personality items
+         H1PF30,       # You have a lot of good qualities
+         H1PF32,       # You have a lot to be proud of
+         H1PF18,       # When you have a problem to solve, one of the first things you do is get as many facts about the problem as possible
+         H1PF19,       # When you are attempting to find a solution to a problem, you usually try to think of as many different ways to approach the problem as possible
+         H1PF20,       # When making decisions, you generally use a systematic method for judging and comparing alternatives
+         H1PF21,       # After carrying out a solution to a problem, you usually try to analyze what went right and what went wrong
+         # Social environment
+         ## neighbourhood
+         H1NB5,        # do you usually feel safe in your neighbourhood (binary: Yes=1, no=0)
+         H1NB6,        # how happy are you with living in your neighbourhood (categorical ordered: not at all, very little, somewhat, quite a bit, very much)
+         ## school 
+         H1ED15,       # trouble getting along with teachers - past year (categorical frequency: Never, a few times, once a week, almost every day, every day)
+         H1ED16,       # trouble paying attention in school - past year (categorical frequency: Never, a few times, once a week, almost every day, every day)
+         H1ED17,       # trouble getting homework done - past year (categorical frequency: Never, a few times, once a week, almost every day, every day)
+         H1ED18,       # trouble getting along with other students - past year (categorical frequency: Never, a few times, once a week, almost every day, every day)
+         H1ED19,       # feel close to people at school - past year (categorical frequency: Never, a few times, once a week, almost every day, every day)
+         H1ED20,       # feel like you are part of your school - past year  (categorical frequency: Never, a few times, once a week, almost every day, every day)
+         H1ED21,       # students at school are prejudiced - past year (categorical frequency: Never, a few times, once a week, almost every day, every day)
+         H1ED22,       # happy to be at your school - past year (categorical frequency: Never, a few times, once a week, almost every day, every day)
+         H1ED23,       # teachers treat students fairly - past year (categorical frequency: Never, a few times, once a week, almost every day, every day)
+         H1ED24,       # feel safe in your school - past year (categorical frequency: Never, a few times, once a week, almost every day, every day)
+         H1PR2,        # feel your teachers care about you (categorical ordered: not at all, very little, somewhat, quite a bit, very much, does not apply)
+         ## friends
+         H1DA7,        # frequency hanging out with friends (categorical frequency: not at all, 1 or 2 times, 3 or 4 times, 5 or more times)
+         H1PR4,        # feel your friends care about you (categorical ordered: not at all, very little, somewhat, quite a bit, very much, does not apply)
+         ## family
+         H1WP9,        # how close do you feel to your mother (categorical frequency: not at all, very little, somewhat, quite a bit, very much)
+         H1WP10,       # how much do you think she cares about you (categorical frequency: not at all, very little, somewhat, quite a bit, very much)
+         H1WP13,       # how close to you feel to your father - lots missing. (categorical frequency: not at all, very little, somewhat, quite a bit, very much)
+         H1WP14,       # how much to you think he cares about you - lots missing. (categorical frequency: not at all, very little, somewhat, quite a bit, very much)
+         H1PF1,        # your mother is warm and loving to you (categorical frequency: strongly agree, agree, neither agree or disagree, disagree, strongly disagree)
+         H1PF4,        # satisfied with the way you and your mother communicate (categoricalstrongly agree, agree, neither agree or disagree, disagree, strongly disagree)
+         H1PF5,        # satisfied with your relationships with your mother (categorical frequency: strongly agree, agree, neither agree or disagree, disagree, strongly disagree)
+         H1PF24,       # satisfied with the way you and your father communicate  (categorical strongly agree, agree, neither agree or disagree, disagree, strongly disagree)
+         H1PF25,       # satisfied with your relationship with your father (categorical frequency: strongly agree, agree, neither agree or disagree, disagree, strongly disagree)
+         H1PR1,        # feel that adults care about you (categorical ordered: not at all, very little, somewhat, quite a bit, very much, does not apply)
+         H1PR3,        # feel your parents care about you (categorical ordered: not at all, very little, somewhat, quite a bit, very much, does not apply)
+         H1PR5,        # feel that people in your family home understand you (categorical ordered: not at all, very little, somewhat, quite a bit, very much, does not apply)
+         H1PR6,        # feel you want to leave home (categorical ordered: not at all, very little, somewhat, quite a bit, very much, does not apply)
+         H1PR7,        # feel that you and your family have fun together (categorical ordered: not at all, very little, somewhat, quite a bit, very much, does not apply)
+         H1PR8,        # feel that your family pays attention to you (categorical ordered: not at all, very little, somewhat, quite a bit, very much, does not apply)
+         ## stressful life events 
+         H1CO10,       # been raped - asked about being raped and raped someone 
+         H1NR3,        # given someone sex in exchange for drugs or money (binary: Yes=1, No=0)
+         H1FV1,        # saw someone shoot or stab another person - past year (categorical frequency: never, once, more than once)
+         H1FV2,        # someone pulled a knife or gun on you - past year (categorical frequency: never, once, more than once)
+         H1FV3,        # someone shot you - past year (categorical frequency: never, once, more than once)
+         H1FV4,        # someone cut or stabbed you - past year (categorical frequency: never, once, more than once)
+         H1FV5,        # you got into a physical fight - past year (categorical frequency: never, once, more than once)
+         H1FV6,        # you were jumped - past year (categorical frequency: never, once, more than once)
+         H1FP21_1,     # how did pregnancy 1 end (categorical: abortion, live birth, hasn't ended, still birth/miscarriage)
+         H1FP21_2,     # how did pregnancy 2 end (categorical: abortion, live birth, hasn't ended, still birth/miscarriage)
+         H1FP21_3,     # how did pregnancy 3 end (categorical: abortion, live birth, hasn't ended, still birth/miscarriage)
+         H1SU4,        # have any of your friends tried to kill themselves - past 12 months (binary: Yes=1, No=0)
+         H1SU5,        # have any of them succeeded 
+         H1SU6,        # have any of your family members tried to kill themselves - past 12 months (binary: Yes=1, No=0)
+         H1SU7,         # have any suceeded
+         ## family income 
+         PA55,               # total family income before taxes - all incomes and sources (numeric: distribution spikes on tens) 
+         PA56,         # do you have enough money to pay your bills (binary: Yes=1, no=0)
+         PA59,         # how easy/hard is it to get medical care for your family (categorical ordered: very easy,somewhat easy, somewhat hard, very hard)
+         H1GH27I      # # reason for not seeking healthcare - couldn't pay (categorical: No to H1GH26, Yes to couldn't pay, No to couldn't pay)
+         )
+```
+
+Context
+
+```{r read in context data}
+context_raw <- read_xpt("/project/rche/data/datasets/addhealth/Contextual Files/Wave I Contextual Data/Context1.xpt")
+head(context_raw)
+```
+
+```{r select context data}
+context <- context_raw %>%
+  select(AID,
+         MATCH, # have a geocode match
+         # Built environment
+         ## healthcare
+         CAR93870,    # Total physicians (non-Federal) providing patient care per 100,000 population - county
+         CAR90906,    # Dentists per 100,000 population - county
+         CAR92918,    # Hospitals per 100,000 population - county
+         CAR92948,    # Inpatient days in short term general hospitals per capita - county
+         CAG92955,    # Presence/absence of hospital abortion provider (1=yes/0=no) - county
+         CAR92953,    # Medicaid short term general hospital occupancy rate per 100 beds - county
+         CAG94960,    # Family planning service providers per 10,000 population - county
+         ## education
+         CST90678,   # Proportion aged 3 years and over in preprimary school that are enrolled in private school
+         BST90679,   # Proportion aged 3 years and over in elementary or high school that are enrolled in private school
+         BST90680,   # Proportion aged 25+ with no high school diploma or equivalency
+         BST90686,   # Proportion aged 25+ with college degree or more
+         CST90696,   # Proportion civilian population aged 16-19 enrolled in school
+         CST90702,   # Proportion aged 16-19 not in school or armed forces and not high school graduate
+         ## labour force
+         BST90714,   # Proportion of civilian labor force that is female
+         CST90731,    # Female labor force opportunity index2 - county
+         BST90732,   # Proportion males (not in the armed forces) aged 16 years and over in the civilian labor force
+         BST90741,   # Proportion persons aged 16 years and over in the labor force who are in the armed forces
+         BST90754,   # Unemployment rate
+         BST90795,   # Proportion employed in managerial and professional specialty occupations
+         BST90796,   # Proportion employed in technical, sales and administrative support occupations
+         BST90797,   # Proportion employed in service occupations
+         BST90798,   # Proportion employed in farming, forestry, and fishing occupations
+         BST90799,   # Proportion employed in precision production, craft, and repair occupations
+         BST90800,   # Proportion employed as operators, fabricators, and laborers
+         ## crime
+         CUC93982,   # Total crime rate per 100,000 population in reporting area - county
+         CUC93990,   # Total juvenile arrests per 100,000 population in reporting area - county
+         CUC93998,   # Total adult arrests per 100,000 population in reporting area - county
+         ## religion
+         CCM90A07,   # Church adherents per capita6 - county
+         CCM90A14,   # Dispersion in religious composition (Jewish, Catholic, Black Baptist, “other”conservative, “other”moderate, “other”liberal) - county
+         ## socioeconomic and poverty 
+         CAR90404,   # Crude death rate2 (per 1,000 individuals) - county
+         BST90431,   # Proportion persons that are in emergency shelters for homeless persons or visible in street locations5
+         BST90544,   # Median household income
+         BST90550,   # Standard deviation in household income distribution
+         BST90584,   # Proportion families with income less than $15,000
+         BST90591,   # Per capita income in 1989
+         BST90598,   # Proportion persons with income in 1989 below poverty level
+         BST90626,   # Proportion families with income in 1989 below poverty level
+         BST90674,   # Proportion related children under 18 years in families with income in 1989 below poverty level
+         CST90816,   # Median gross rent of specified renter-occupied housing units paying cash rent
+         CST90822,   # Standard deviation in gross rent of specified renter-occupied housing units paying cash rent
+         BST90803,   # Proportion occupied housing units that are owner-occupied
+         BST90857,   # Proportion occupied housing units lacking complete plumbing facilities
+         BST90865,   # Proportion housing units lacking complete kitchen facilities
+         CSD90868,   # Proportion school age children (6-19 years) who are “at risk”2 school age children - county
+         CSD90869,   # Proportion pre-school age children (4-5 years) who are “at risk”2 pre-school age children - county
+         ## political
+         CCU92A27,   # Proportion voting democratic in 1992 presidential election - county
+         CCU92A28,   # Proportion voting republican in 1992 presidential election - county
+         CCU92A29,   # Proportion voting for Perot in 1992 presidential election - county
+         CCU87A54,   # Proportion of local government direct general expenditures for education - county
+         CCU87A55,   # Proportion of local government direct general expenditures for health and hospitals - county
+         CCU87A56,   # Proportion of local government direct general expenditures for public welfare - county
+         CCU87A57,   # Proportion of local government direct general expenditures for police protection - county
+         CCU87A58,   # Proportion of local government direct general expenditures, other type - county
+         # Natural environment 
+         ## population density
+         BST90001,   # Total population (county)
+         BST90005,   # Density (persons/sq. km.) (county)
+         BST90437,   # Households (absolute number)
+         ## urban distances
+         URBAN      # Urban Rural Code for Block Group Residence (1=Completely Urbanized/0=Partly Rural)
+  )
+```
+
+Political
+
+```{r read in political data}
+political_raw <- read_xpt("/project/rche/data/datasets/addhealth/Contextual Files/Wave I, II & III  Political Context Data/w1polcon.xpt")
+```
+
+```{r select political data}
+political <- political_raw %>%
+  select(AID,
+         ## labour force
+         W1PCC190,   # Proportion working outside the county of residence, 1990
+         W1PCC290,   # Median travel time to work, 1990
+         ## political
+         W1PCP192,   # Proportion of votes cast for the Democratic presidential candidate, 1992
+         W1PCP292   # Proportion of votes cast for the Republican presidential candidate, 1992
+  )
+```
+
+Obesity and Neighborhood Environment Files 
+
+```{r read in population density files}
+pop_dens_raw <- read_xpt("/project/rche/data/datasets/addhealth/ONE - Obesity and Neighborhood Environment Files/Wave I Population Density Data/w1pop90.xpt")
+```
+
+```{r select pop dense data}
+pop_dens <- pop_dens_raw %>%
+  select(AID,
+         # population density
+         W1P90_P8   # 1990 block group population, 8 km
+  )
+```
+
+```{r read in land cover}
+land_cover_raw <- read_xpt("/project/rche/data/datasets/addhealth/ONE - Obesity and Neighborhood Environment Files/Wave I Land Cover Data/w1lndcv.xpt")
+```
+
+```{r select land cover}
+land_cover <- land_cover_raw %>%
+  select(AID,
+         ## climate
+         W1LCA_L8   # Landscape total area (sq m)
+  )
+```
+
+```{r read in climate}
+climate_raw <- read_xpt("/project/rche/data/datasets/addhealth/ONE - Obesity and Neighborhood Environment Files/Wave I Climate File/w1climat.xpt")
+```
+
+```{r select climate data}
+climate <- climate_raw %>%
+  select(AID,
+         ## climate
+         W1CL1_A,    # Mean total precipitation, annually. Reported in inches
+         W1CL2_A,    # Mean total snowfall, annually. Reported in inches
+         W1CL3_A,    # Mean daytime sky cover, annually. Reported as percent sky cover
+         W1CL4_A,    # Mean sunshine total hours, annually. Reported as mean monthly hours
+         W1CL7_A,    # Mean number of days maximum temperature >= 90 F, annually
+         W1CL8_A     # Mean number of days minimum temperature <= 32 F, annually
+  )
+```
+
+```{r read in road connectivity data}
+road_raw <- read_xpt("/project/rche/data/datasets/addhealth/ONE - Obesity and Neighborhood Environment Files/Wave I Street Connectivity File/w1conn.xpt")
+```
+
+```{r select road data}
+road <- road_raw %>%
+  select(AID,
+         ## population density
+         W1CN01_8,   # Road connectivity (Alpha index, 8km) 
+         W1CN04_8,   # Cul de sac density-sqkm, 8km
+         W1CN13_8    # Link (roads) count, 8km
+  )
+```
+
+```{r read in road connectivity data}
+parks_raw <- read_xpt("/project/rche/data/datasets/addhealth/ONE - Obesity and Neighborhood Environment Files/Wave I Parks Data/w1parks.xpt")
+```
+
+```{r select road data}
+parks <- parks_raw %>%
+  select(AID,
+         ## urban distances
+         W1PKC1K8   # Park count 8km
+  )
+```
+
+```{r read in school distance data}
+school_dis_raw <- read_xpt("/project/rche/data/datasets/addhealth/ONE - Obesity and Neighborhood Environment Files/Wave I School Distance Measures/w1schdis.xpt")
+```
+
+```{r select school distance data}
+school_dis <- school_dis_raw %>%
+  select(AID,
+         ## urban distances
+         W1SD1      # Distance to school in meters
+  )
+```
+
+```{r read in RUCA data}
+ruca_raw <- read_xpt("/project/rche/data/datasets/addhealth/ONE - Obesity and Neighborhood Environment Files/Wave I Rural-Urban Commuting Area (RUCA) Codes/w1ruca.xpt")
+```
+
+```{r select RUCA data}
+ruca <- ruca_raw %>%
+  select(AID,
+         ## urban distances
+         W1RU1      # Rural-Urban commuting area (RUCA) Code, 1990
+  )
+```
+
+W1A variables
+
+```{r depression items W1A}
+CESD.W1A.items <- c("H1FS1",          # bothered 
+                   "H1FS2",           # poor appetite
+                   "H1FS3",           # couldn't shake the blues
+                   "H1FS4",           # just as good as other people  - reversed
+                   "H1FS5",           # trouble paying attention
+                   "H1FS6",           # felt depressed
+                   "H1FS7",           # too tired to do things
+                   "H1FS8",           # hopeful about future          - reversed
+                   "H1FS9",           # life had been a failure
+                   "H1FS10",          # felt fearful 
+                   "H1FS11",          # happy                         - reversed
+                   "H1FS12",          # talked less than usual
+                   "H1FS13",          # felt lonely
+                   "H1FS14",          # people were unfriendly
+                   "H1FS15",          # enjoyed life                  - reversed 
+                   "H1FS16",          # felt sad 
+                   "H1FS17",          # felt people disliked you
+                   "H1FS18",          # hard to get started
+                   "H1FS19"           # life was not worth living
+         ) 
+
+CESD.items.key.W1A <- c(  # scoring key: -1 is reverse coded
+                      1, # 1
+                      1, # 2
+                      1,  # 3
+                     -1, # 4
+                      1, # 5 
+                      1, # 6
+                      1, # 7 
+                     -1, # 8
+                      1, # 9
+                      1, # 10
+                     -1, # 11
+                      1, # 12
+                      1, # 13
+                      1, # 14
+                     -1, # 15
+                      1, # 16
+                      1, # 17
+                      1, # 18
+                      1  # 19
+                     ) 
+```
+
+```{r cleaning missingness coding}
+dat_W1A <- inhome_raw %>%
+  mutate(across(c(CESD.W1A.items), 
+                ~ case_when(. %in% c(6, 7, 8, 9) ~ NA_real_, 
+                            TRUE ~ .))) %>%
+  select(AID, CESD.W1A.items)
+```
+
+```{r depression items W1B}
+CESD.W1B.items <- c("H1FS1",          # bothered 
+                   "H1FS3",           # couldn't shake the blues
+                   "H1FS4",           # just as good as other people  - reversed
+                   "H1FS5",           # trouble paying attention
+                   "H1FS6",           # felt depressed
+                   "H1FS7",           # too tired to do things
+                   "H1FS11",          # happy                       - reversed
+                   "H1FS15",          # enjoyed life               - reversed 
+                   "H1FS16",          # felt sad 
+                   "H1FS17"           # felt people disliked you
+         ) 
+
+CESD.items.key.W1B <- c(1, # scoring key: -1 is reverse coded
+                      1, 
+                     -1, 
+                      1, 
+                      1, 
+                      1, 
+                     -1, 
+                     -1, 
+                      1, 
+                      1) 
+```
+
+# Wave 4
+
+We will read in depression scores and diagnostic information from wave IV. 
+
+```{r read in wave 4 raw data}
+dat.W4.raw <- read_xpt("/project/rche/data/datasets/addhealth/Core Files - Wave IV/Wave IV In Home Interview Data/wave4/wave4.xpt")
+```
+
+```{r read in wave 4 depression items}
+CESD.W4.items <- c("H4MH18", 
+                   "H4MH19", 
+                   "H4MH20", 
+                   "H4MH21", 
+                   "H4MH22", 
+                   "H4MH23", 
+                   "H4MH24", 
+                   "H4MH25", 
+                   "H4MH26", 
+                   "H4MH27") 
+```
+
+```{r cleaning missingness coding}
+dat_W4 <- dat.W4.raw %>%
+  mutate(across(c(CESD.W4.items), 
+                ~ case_when(. %in% c(6, 7, 8, 9) ~ NA_real_, 
+                            TRUE ~ .))) %>%
+  select(AID, CESD.W4.items)
+```
+
+PCs 
+
+```{r 20 ancestry PCs}
+ancestry_PCs <- read.table("/project/rche/data/datasets/addhealth/clean_progress/genetic_files/qc/archive/ahgwas.QC.rel.ALL.pca.eigenvec", header = FALSE)
+
+ancestry_PCs <- ancestry_PCs %>% rename(FID = V1, 
+                                        AID = V2, 
+                                        an_PC1 = V3, 
+                                        an_PC2 = V4, 
+                                        an_PC3 = V5, 
+                                        an_PC4 = V6, 
+                                        an_PC5 = V7, 
+                                        an_PC6 = V8, 
+                                        an_PC7 = V9, 
+                                        an_PC8 = V10, 
+                                        an_PC9 = V11, 
+                                        an_PC10 = V12, 
+                                        an_PC11 = V13, 
+                                        an_PC12 = V14,
+                                        an_PC13 = V15,
+                                        an_PC14 = V16,
+                                        an_PC15 = V17,
+                                        an_PC16 = V18,
+                                        an_PC17 = V19,
+                                        an_PC18 = V20,
+                                        an_PC19 = V21,
+                                        an_PC20 = V22) %>% 
+  mutate(across(everything(), as.numeric))
+
+ancestry_PCs
+```
+
+Ancestry groups
+
+```{r read in release2 ancestry}
+rel2 <- read_xpt("/project/rche/data/datasets/addhealth/Genetic Files/Wave IV Polygenic Scores - Release 2/pgs2.xpt")
+
+rel2_ancestry <- rel2 %>%
+  mutate(AID = as.character(AID), FID = as.character(FID)) %>%
+  select(AID, PSANCEST, PSRACE)
+```
+
+# Combine all data
+
+```{r combine all data}
+dat_list <- list(inhome, context, political, pop_dens, land_cover, climate, road, parks, school_dis, ruca, dat_W1A, dat_W4, rel2_ancestry)
+dat_raw <- reduce(dat_list, full_join, by = "AID")
+
+colnames(dat_raw)
+ncol(dat_raw)
+nrow(dat_raw)
+```
+
+```{r sample matching RQ1}
+dat <- dat_raw %>%
+  filter(AID %in% ALL_matching_ids_nosibs$AID) # matching IDs from RQ 1
+ #  %>% filter(MATCH != 0)
+
+dat <- dat %>%
+  mutate(W1LCA_L8 = case_when(W1LCA_L8 == 999999999 ~ NA_real_, TRUE ~ as.numeric(W1LCA_L8)),
+         W1CL2_A = case_when(W1CL2_A == 99999.0 ~ NA_real_, TRUE ~ as.numeric(W1CL2_A)))
+```
+
+# Missingness
+
+```{r identify variables with high missingness}
+threshold <- 0 # set threshold
+
+# dat.erm.theory1
+as.data.frame(find_vars_with_na(dat, threshold))
+```
+
+Following have high missingness on block level that is not at county level: BST90678, BST90696, BST90702, BST90816, BST90822
+
+So will go back and use county-level variables for these to save data. 
+
+# Random imputation 
+
+Compute random imputation for continuous vars
+
+```{r random imputation for PA55_clean}
+impute.items <- c("PA55", "PA56", "PA59", "CAR93870", "CAR90906", "CAR92918", "CAR92948", "CAG92955", "CAR92953", "CAG94960", "CST90678", "BST90679", "BST90680", "BST90686", "CST90696", "CST90702", "BST90714", "CST90731", "BST90732", "BST90741", "BST90754", "BST90795", "BST90796", "BST90797", "BST90798", "BST90799", "BST90800", "CUC93982", "CUC93990", "CUC93998", "CCM90A07", "CCM90A14", "CAR90404", "BST90431", "BST90544", "BST90550", "BST90584", "BST90591", "BST90598", "BST90626", "BST90674", "CST90816", "CST90822", "BST90803", "BST90857", "BST90865", "CSD90868", "CSD90869", "CCU92A27", "CCU92A28", "CCU92A29", "CCU87A54", "CCU87A55", "CCU87A56", "CCU87A57", "CCU87A58", "BST90001", "BST90005", "BST90437",    "URBAN",     "H1FS1",    "H1FS3", "H1FS8", "H1FS10",   "H1FS12",   "H1FS13",  "H1FS19", "H4MH18",   "H4MH19",   "H4MH20",   "H4MH24",   "H4MH25",   "H4MH27", "W1LCA_L8", "W1CL2_A")
+
+as.data.frame(find_vars_with_na(dat, threshold))
+
+dat <- dat %>%
+  mutate(across(c(impute.items), 
+                ~ random_sample_imputation(.),
+                .names = "{.col}_impute")) %>%
+  select(-impute.items)
+
+# check
+find_vars_with_na(dat, threshold)
+ncol(dat)
+nrow(dat)
+```
+
+```{r new imputed lists}
+CESD.W1A.items <- c("H1FS1_impute",   # bothered 
+                   "H1FS2",           # poor appetite
+                   "H1FS3_impute",    # couldn't shake the blues
+                   "H1FS4",           # just as good as other people  - reversed
+                   "H1FS5",           # trouble paying attention
+                   "H1FS6",           # felt depressed
+                   "H1FS7",           # too tired to do things
+                   "H1FS8_impute",    # hopeful about future          - reversed
+                   "H1FS9",           # life had been a failure
+                   "H1FS10_impute",   # felt fearful 
+                   "H1FS11",          # happy                         - reversed
+                   "H1FS12_impute",   # talked less than usual
+                   "H1FS13_impute",   # felt lonely
+                   "H1FS14",          # people were unfriendly
+                   "H1FS15",          # enjoyed life                  - reversed 
+                   "H1FS16",          # felt sad 
+                   "H1FS17",          # felt people disliked you
+                   "H1FS18",          # hard to get started
+                   "H1FS19_impute"    # life was not worth living
+         ) 
+
+CESD.W4.items <- c("H4MH18_impute", 
+                   "H4MH19_impute", 
+                   "H4MH20_impute", 
+                   "H4MH21", 
+                   "H4MH22", 
+                   "H4MH23", 
+                   "H4MH24_impute", 
+                   "H4MH25_impute", 
+                   "H4MH26", 
+                   "H4MH27_impute") 
+```
+
+#### Dummy recoding
+
+Create dummy variables for the categorical variables with more than two categories. 
+
+The reference categories below are considered what is "healthy" or "typical". 
+
+```{r select categorical vars}
+dat_cat <- dat %>%
+  select(-AID, -BIO_SEX, -H1GI1Y, -CESD.W1A.items, -CESD.W4.items) %>% # remove not wanted data
+  select(starts_with("H"), PA56_impute, PA59_impute, URBAN_impute, CAG92955_impute) # select all categorical vars
+
+names(dat_cat)
+```
+
+```{r reference categories for dummy variables}
+# set the reference categories for each dummy coded variable - default is first category if not included
+reference_category <- list(
+                           # psych system
+                           "H1GH1" = 1,        # 1 = excellent general health, second largest 
+                           "H1GH26" = 0,       # 0 = no didn't seek med care, largest
+                           "H1GH48" = 0,       # 0 = never health/emotion problem day off, largest
+                           "H1GH49" = 0,       # 0 = never health/emotion problem miss activity, largest
+                           "H1GH8" = 0,        # 0 = never fatigue, third largest 
+                           "H1GH18" = 0,       # 0 = never sleep problems, largest
+                           "H1GH19" = 0,       # 0 = never trouble relaxing, largest
+                           "H1GH22" = 0,       # 0 = never fearfulness, largest
+                           "H1HS3" = 0,        # 0 = not had counselling, largest - *usure on this reference cat*
+                           "H1PL1" = 0,        # 0 = no physical condition, largest 
+                           "H1GH2" = 0,        # 0 = never headache, third largest 
+                           "H1GH3" = 0,        # 0 = never feeling hot, largest 
+                           "H1GH4" = 0,        # 0 = never stomach ache, third largest 
+                           "H1GH5" = 0,        # 0 = never cold sweats, largest 
+                           "H1GH6" = 0,        # 0 = never feeling weak, largest 
+                           "H1GH7" = 0,        # 0 = never sore throat, second largest 
+                           "H1GH9" = 0,        # 0 = never painful urination, largest 
+                           "H1GH10" = 0,       # 0 = never feeling really sick, largest 
+                           "H1GH11" = 0,       # 0 = never waking up tired, third largest 
+                           "H1GH12" = 0,       # 0 = never skin problems, second largest 
+                           "H1GH13" = 0,       # 0 = never dizziness, largest 
+                           "H1GH14" = 0,       # 0 = never chest pains, largest 
+                           "H1GH15" = 0,       # 0 = never aches and pains, second largest 
+                           "H1GH16" = 0,       # 0 = never period pains, second largest (after being male)
+                           "H1GH17" = 0,       # 0 = never poor appetite, largest
+                           "H1GH28" = 3,       # 0 = about right weight, largest
+                           "H1GH29" = 3,       # 0 = stay the same weight, largest
+                           "H1PF33" = 1,       # 1 = strong agree you like yourself, second largest
+                           "H1PF34" = 1,       # 1 = strong agree doing everything right, third largest 
+                           "H1PF35" = 1,       # 1 = strong agree feel socially accepted, second largest 
+                           "H1PF36" = 1,       # 1 = strong agree feel loved, second largest
+                           "H1PF30" = 1,       # 1 = strongly agree have a lot of good qualities
+                           "H1PF32" = 1,       # 1 = strongly agree have a lot to be proud of
+                           "H1PF18" = 1,       # 1 = strongly agree get facts about problem
+                           "H1PF19" = 1,       # 1 = strongly agree approach problem differently
+                           "H1PF20" = 1,       # 1 = strongly agree systematic about problem
+                           "H1PF21" = 1,       # 1 = strongly agree analyse what went wrong in problem
+                           # social system
+                           "H1NB5" = 1,        # 1 = yes safe in neighborhood, largest 
+                           "H1NB6" = 5,        # 5 = very happy in neighborhood, second largest 
+                           "H1ED15" = 0,       # 0 = never trouble getting along w teachers, second largest
+                           "H1ED16" = 0,       # 0 = never trouble paying attention, second largest 
+                           "H1ED17" = 0,       # 0 = never trouble doing homework, second largest
+                           "H1ED18" = 0,       # 0 = never trouble getting along w students, second largest
+                           "H1ED19" = 5,       # 5 = every day close to people, smallest
+                           "H1ED20" = 5,       # 5 = every day part of school, smallest
+                           "H1ED21" = 0,       # 0 = never prejudice, fourth largest 
+                           "H1ED22" = 5,       # 5 = every day happy to be at school, second largest
+                           "H1ED23" = 5,       # 5 = every day treat students fairly, third largest
+                           "H1ED24" = 5,       # 5 = every day feel safe in school, second largest
+                           "H1PR2" = 5,        # 5 = very much feel teachers care, third largest 
+                           "H1DA7" = 4,        # 4 = 5 or more times see friends, smallest
+                           "H1PR4" = 5,        # 5 = very much feel friends care, largest 
+                           "H1WP9" = 5,        # 5 = very close to mother, largest
+                           "H1WP10" = 5,       # 5 = very much mother cares, largest
+                           "H1WP13" = 5,       # 5 = very close to father, largest
+                           "H1WP14" = 5,       # 5 = very much father cares, largest
+                           "H1PF1" = 1,        # 1 = strong agree mother is warm, largest 
+                           "H1PF4" = 1,        # 1 = strong agree satisfied w mother communication, second largest
+                           "H1PF5" = 1,        # 1 = strong agree satisfied w mother relationship, largest 
+                           "H1PF24" = 1,       # 1 = strong agree satisfied w father communication, third largest 
+                           "H1PF25" = 1,       # 1 = strong agree satisfied w father relationship, largest 
+                           "H1PR1" = 5,        # 5 = very much feel adults care, largest 
+                           "H1PR3" = 5,        # 5 = very much feel parents care, largest 
+                           "H1PR5" = 5,        # 5 = very much think family understand you, third largest
+                           "H1PR6" = 1,        # 1 = not at all want to leave home, largest
+                           "H1PR7" = 5,        # 5 = very much family have fun, second largest
+                           "H1PR8" = 5,        # 5 = very much family pays attention, second largest
+                           "H1CO10" = 0,       # 0 = not raped, second largest after male
+                           "H1NR3" = 0,        # 0 = not exchanged sex, largest 
+                           "H1FV1" = 0,        # 0 = never seen stabbing, largest
+                           "H1FV2" = 0,        # 0 = never had knife pulled, largest
+                           "H1FV3" = 0,        # 0 = never been shot, largest
+                           "H1FV4" = 0,        # 0 = never been stabbed, largest
+                           "H1FV5" = 0,        # 0 = never in physical fight, largest
+                           "H1FV6" = 0,        # 0 = never been jumped, largest
+                           "H1FP21_1" = 7,     # 7 = legitimate skip - no pregnancy 
+                           "H1FP21_2" = 7,     # 7 = legitimate skip - no pregnancy 
+                           "H1FP21_3" = 7,     # 7 = legitimate skip - no pregnancy 
+                           "H1SU4" = 0,        # 0 = friend tried to kill themselves
+                           "H1SU5" = 0,        # 0 = friend didn't succeed suicide
+                           "H1SU6" = 0,        # 0 = family not tried to kill themselves
+                           "H1SU7" = 0,        # 0 = family didn't succeed
+                           "PA56_impute" = 1,  # 1 = yes money for bills, largest 
+                           "H1GH27I" = 0,      # 0 = no to couldn't pay, largest after leg skip
+                           "PA59_impute" = 1,  # 1 = easy to get medical care, largest 
+                           # built system 
+                           "CAG92955_impute" = 1, # 1 = yes presence of hospital abortion provider
+                           "URBAN_impute" = 0  # 0 = partly rural
+                           )
+
+# Create new dataset with dummy variables
+dat_dummy <- create_dummy_variables(data = dat,
+                                    categorical_data = dat_cat,
+                                    reference_category)
+
+# Check the names of the variables
+length(colnames(dat_dummy))
+colnames(dat_dummy)
+```
+
+# Group variables by system
+
+```{r select psychological systems}
+# psychological systems
+psych_syst <- dat_dummy %>%
+  select(
+    AID,
+    contains("H1GH1") |
+    contains("H1GH26")|
+    contains("H1GH48")|
+    contains("H1GH49")|
+    contains("H1GH8")|
+    contains("H1GH18")|
+    contains("H1GH19")|
+    contains("H1GH22")|
+    contains("H1HS3")|
+    contains("H1PL1")|
+    contains("H1GH2")|
+    contains("H1GH3")|
+    contains("H1GH4")|
+    contains("H1GH5")|
+    contains("H1GH6")|
+    contains("H1GH7")|
+    contains("H1GH9")|
+    contains("H1GH10")|
+    contains("H1GH11")|
+    contains("H1GH12")|
+    contains("H1GH13")|
+    contains("H1GH14")|
+    contains("H1GH15")|
+    contains("H1GH16")|
+    contains("H1GH17")|
+    contains("H1GH28")|
+    contains("H1GH29")|
+    contains("H1PF33")|
+    contains("H1PF34")|
+    contains("H1PF35")|
+    contains("H1PF36")|
+    contains("H1PF30")|
+    contains("H1PF32")|
+    contains("H1PF18")|
+    contains("H1PF19")|
+    contains("H1PF20")|
+    contains("H1PF21")
+    )
+
+write.table(psych_syst, "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/psych_syst.txt", row.names = FALSE) 
+```
+
+```{r select psychological systems}
+# social systems
+soc_syst <- dat_dummy %>%
+  select(
+    AID,
+    contains("H1NB5") |
+    contains("H1NB6") |
+    contains("H1ED15") |
+    contains("H1ED16") |
+    contains("H1ED17") |
+    contains("H1ED18") |
+    contains("H1ED19") |
+    contains("H1ED20") |
+    contains("H1ED21") |
+    contains("H1ED22") |
+    contains("H1ED23") |
+    contains("H1ED24") |
+    contains("H1PR2") |
+    contains("H1DA7") |
+    contains("H1PR4") |
+    contains("H1WP9") |
+    contains("H1WP10") |
+    contains("H1WP13") |
+    contains("H1WP14") |
+    contains("H1PF1") |
+    contains("H1PF4") |
+    contains("H1PF5") |
+    contains("H1PF24") |
+    contains("H1PF25") |
+    contains("H1PR1") |
+    contains("H1PR3") |
+    contains("H1PR5") |
+    contains("H1PR6") |
+    contains("H1PR7") |
+    contains("H1PR8") |
+    contains("H1CO10") |
+    contains("H1NR3") |
+    contains("H1FV1") |
+    contains("H1FV2") |
+    contains("H1FV3") |
+    contains("H1FV4") |
+    contains("H1FV5") |
+    contains("H1FV6") |
+    contains("H1FP21_1") |
+    contains("H1FP21_2") |
+    contains("H1FP21_3") |
+    contains("H1SU4") |
+    contains("H1SU5") |
+    contains("H1SU6") |
+    contains("H1SU7") |
+    contains("PA55") |
+    contains("PA56") |
+    contains("H1GH27I") |
+    contains("PA59") 
+  )
+
+write.table(soc_syst, "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/soc_syst.txt", row.names = FALSE) 
+```
+
+```{r select psychological systems}
+# built systems
+built_syst <- dat_dummy %>%
+  select(
+    AID,
+    contains("CAR93870") |
+    contains("CAR90906") |
+    contains("CAR92918") |
+    contains("CAR92948") |
+    contains("CAG92955") |
+    contains("CAR92953") |
+    contains("CAG94960") |
+    contains("CST90678") |
+    contains("CST90679") |
+    contains("CST90680") |
+    contains("CST90686") |
+    contains("CST90696") |
+    contains("CST90702") |
+    contains("CST90714") |
+    contains("CST90731") |
+    contains("CST90732") |
+    contains("CST90741") |
+    contains("CST90754") |
+    contains("CST90795") |
+    contains("CST90796") |
+    contains("CST90797") |
+    contains("CST90798") |
+    contains("CST90799") |
+    contains("CST90800") |
+    contains("W1PCC190") |
+    contains("W1PCC290") |
+    contains("CUC93982") |
+    contains("CUC93990") |
+    contains("CUC93998") |
+    contains("CCM90A07") |
+    contains("CCM90A14") |
+    contains("CAR90404") |
+    contains("CST90431") |
+    contains("CST90544") |
+    contains("CST90550") |
+    contains("CST90584") |
+    contains("CST90591") |
+    contains("CST90598") |
+    contains("CST90626") |
+    contains("CST90674") |
+    contains("CST90816") |
+    contains("CST90822") |
+    contains("CST90803") |
+    contains("CST90857") |
+    contains("CST90865") |
+    contains("CSD90868") |
+    contains("CSD90869") |
+    contains("CCU92A27") |
+    contains("CCU92A28") |
+    contains("CCU92A29") |
+    contains("CCU87A54") |
+    contains("CCU87A55") |
+    contains("CCU87A56") |
+    contains("CCU87A57") |
+    contains("CCU87A58") |
+    contains("W1PCP192") |
+    contains("W1PCP292") 
+  )
+
+write.table(built_syst, "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/built_syst.txt", row.names = FALSE) 
+```
+
+```{r select psychological systems}
+# natural systems
+nat_syst <- dat_dummy %>%
+  select(
+    AID,
+    contains("CST90001") |
+    contains("CST90005") |
+    contains("CST90437") |
+    contains("W1CN01_8") |
+    contains("W1CN04_8") |
+    contains("W1CN13_8") |
+    contains("W1P90_P8") |
+    contains("URBAN") |
+    contains("W1PKC1K8") |
+    contains("W1RU1") |
+    contains("W1SD1") |
+    contains("W1CL1_A") |
+    contains("W1CL2_A") |
+    contains("W1CL3_A") |
+    contains("W1CL4_A") |
+    contains("W1CL7_A") |
+    contains("W1CL8_A") |
+    contains("W1LCA_L8") 
+  )
+
+write.table(nat_syst, "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/nat_syst.txt", row.names = FALSE) 
+```
+
+# Copy files over from RQ1
+
+```{bash copy files}
+cp /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/domains/IDs_IID.fam /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+cp /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/domains/grm_full_out.grm_reformat /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+cp /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/domains/pheno_W1A_IID.txt /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+cp /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/domains/pheno_W1B_IID.txt  /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+cp /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/domains/pheno_W4_IID.txt  /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+cp /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/domains/covariate_cat_IID.txt  /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+cp /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/domains/covariate_cont_IID.txt  /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+```
+
+# PCA transformation
+
+```{r loop for PCA for domains}
+input_dir <- "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems"
+
+# List all .txt files in the input directory
+txt_files <- list.files(input_dir, pattern = "^(nat|built|soc|psych)_syst.txt$", full.names = TRUE)
+
+matching_id_grm_erm <- read.table("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/IDs_IID.fam")
+colnames(matching_id_grm_erm) <- c("AID", "AID2", "PID", "MID", "Sex", "Phenotype")
+
+# Loop over each txt file
+for (file in txt_files) {
+  # Step 1: Read the current file into a dataframe
+  current_df <- read.table(file, header = TRUE)
+
+  # Step 2: Apply the dummy coding function
+  dat_dummy <- current_df # dummy coding has already been done
+  dummy_names <- setdiff(names(dat_dummy), "AID")
+
+  # Step 3: PCA Transformation
+  dat_dummy_noID <- as.matrix(dat_dummy[, -1])  # Exclude AID for PCA
+  dummy_covmat <- var(dat_dummy_noID)           # Covariance matrix
+  eig <- eigen(dummy_covmat)                    # Eigen decomposition
+  pca_vector <- dat_dummy_noID %*% eig$vectors  # PCA transformation
+  pca_scaled <- scale(pca_vector)               # Normalize the matrix
+  m <- dim(pca_scaled)[2]
+  pca <- pca_scaled / sqrt(m)                   # Normalize by sqrt(m)
+  pca_df <- as.data.frame(pca)
+  colnames(pca_df) <- dummy_names
+
+  # Step 4: Attach the AID variable back
+  pca_df <- cbind(AID = dat_dummy$AID, AID2 = dat_dummy$AID, pca_df)
+  
+  # Convert to numeric matrix (ensures all values are numeric)
+  filtered_numeric <- pca_df %>%
+    mutate(AID = as.numeric(AID)) %>%
+    mutate(AID2 = as.numeric(AID2))
+
+  filtered_df <- filtered_numeric[, colSums(!is.na(filtered_numeric)) > 0]
+
+  # Reorder the file to match the ID file
+  filtered_reordered <- filtered_df[order(match(filtered_df$AID, as.numeric(matching_id_grm_erm$AID))), ]
+
+  # Save the current dataframe to a file
+  temp_filename <- file.path(input_dir, paste0("dat_", tools::file_path_sans_ext(basename(file))))
+  write.table(filtered_reordered, temp_filename, row.names = FALSE, col.names = FALSE, quote = FALSE, sep="\t")
+}
+```
+
+# Syst model
+
+```{r create joint txt file}
+# create txt file with all erms
+all_systems.txt <- c("grm_full_out.grm_reformat", "erm_dat_psych_syst", "erm_dat_soc_syst", "erm_dat_built_syst", "erm_dat_nat_syst")
+  
+write.table(all_systems.txt, "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/all_systems.txt", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\t")
+```
+
+## REML 
+
+**Navigate to the terminal/shell on Rossmann, and execute:**
+sbatch /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/mtg2_syst_reml.txt
+
+You can then run the following to check it's status:
+squeue -u thom1336
+
+This will run the following as a job on Rossmann:
+
+```{bash REML for syst}
+# Define directory
+#cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+#
+## List of files to process
+#files=(
+#    "dat_built_syst"
+#    "dat_nat_syst"
+#    "dat_psych_syst"
+#    "dat_soc_syst"
+#)
+#
+## Step 1: Run all ERM commands for all files first
+#    for file in "${files[@]}"; do
+#        echo "Processing ERM for file: $file in $dir"
+#        ./../../../mtg2 -p IDs_IID.fam -pdmx "$file" -thread 100 -out "erm_$file"
+#    done
+#
+## Step 2: Run REML only after all ERM outputs are generated
+#    echo "Running REML for directory: $dir"
+#    ./../../../mtg2 -p IDs_IID.fam -mg all_systems.txt -d pheno_W1A_IID.txt -cc covariate_cat_IID.txt –qc covariate_cont_IID.txt -mod 1 -thread 100 -out syst_W1A.out > syst_W1A.log
+#    ./../../../mtg2 -p IDs_IID.fam -mg all_systems.txt -d pheno_W1B_IID.txt -cc covariate_cat_IID.txt –qc covariate_cont_IID.txt -mod 1 -thread 100 -out syst_W1B.out > syst_W1B.log
+#    ./../../../mtg2 -p IDs_IID.fam -mg all_systems.txt -d pheno_W4_IID.txt -cc covariate_cat_IID.txt –qc covariate_cont_IID.txt -mod 1 -thread 100 -out syst_W4.out > syst_W4.log
+```
+
+## Delta output prep
+
+```{r do file for syst_W1A}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_W1A.do")                      # create file with this name
+cat("syst_W1A.out2", "\n")               # line 1: specify the file with parameter estimates (above)
+cat(6, "\n")                                               # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6", "\n")       # line 3: compute prop. of variance due to genetic
+cat("R 3 1 2 4 5 6", "\n")       # line 4: compute prop. of variance due to psych
+cat("R 4 1 2 3 5 6", "\n")       # line 5: compute prop. of variance due to soc
+cat("R 5 1 2 3 4 6", "\n")       # line 6: compute prop. of variance due to built
+cat("R 6 1 2 3 4 5", "\n")       # line 7: compute prop. of variance due to nat
+cat("R 1 2 3 4 5 6", "\n")        # line 11: compute prop. of variance due to error
+sink()
+```
+
+```{r do file for syst_W1B}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_W1B.do")                      # create file with this name
+cat("syst_W1B.out2", "\n")               # line 1: specify the file with parameter estimates (above)
+cat(6, "\n")                                               # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6", "\n")       # line 3: compute prop. of variance due to genetic
+cat("R 3 1 2 4 5 6", "\n")       # line 4: compute prop. of variance due to psych
+cat("R 4 1 2 3 5 6", "\n")       # line 5: compute prop. of variance due to soc
+cat("R 5 1 2 3 4 6", "\n")       # line 6: compute prop. of variance due to built
+cat("R 6 1 2 3 4 5", "\n")       # line 7: compute prop. of variance due to nat
+cat("R 1 2 3 4 5 6", "\n")        # line 11: compute prop. of variance due to error
+sink()
+```
+
+```{r do file for syst_W4}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_W4.do")                      # create file with this name
+cat("syst_W4.out2", "\n")               # line 1: specify the file with parameter estimates (above)
+cat(6, "\n")                                               # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6", "\n")       # line 3: compute prop. of variance due to genetic
+cat("R 3 1 2 4 5 6", "\n")       # line 4: compute prop. of variance due to psych
+cat("R 4 1 2 3 5 6", "\n")       # line 5: compute prop. of variance due to soc
+cat("R 5 1 2 3 4 6", "\n")       # line 6: compute prop. of variance due to built
+cat("R 6 1 2 3 4 5", "\n")       # line 7: compute prop. of variance due to nat
+cat("R 1 2 3 4 5 6", "\n")        # line 11: compute prop. of variance due to error
+sink()
+```
+
+```{bash output for e_g_cov_reml}
+cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+    
+     grep -vwE '(LKH|h2)' syst_W1A.out > syst_W1A.out2
+     grep -vwE '(LKH|h2)' syst_W1B.out > syst_W1B.out2
+     grep -vwE '(LKH|h2)' syst_W4.out >  syst_W4.out2
+
+     ./../../../mtg2 -delta2 syst_W1A.do > syst_W1A.out3
+     ./../../../mtg2 -delta2 syst_W1B.do > syst_W1B.out3
+     ./../../../mtg2 -delta2 syst_W4.do > syst_W4.out3
+```
+
+## Output table
+
+```{r output table for health w g}
+syst_output_W1A <- extract_delta_output(
+  outcome = "W1A",
+  model_prefix = "syst",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error")
+)
+
+# add interaction description - to merge with later data
+syst_output_W1A <- syst_output_W1A %>%
+  mutate(cor_interaction = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error"))
+
+syst_output_W1B <- extract_delta_output(
+  outcome = "W1B",
+  model_prefix = "syst",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error")
+)
+
+# add interaction description - to merge with later data
+syst_output_W1B <- syst_output_W1B %>%
+  mutate(cor_interaction = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error"))
+
+
+syst_output_W4 <- extract_delta_output(
+  outcome = "W4",
+  model_prefix = "syst",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error")
+)
+
+# add interaction description - to merge with later data
+syst_output_W4 <- syst_output_W4 %>%
+  mutate(cor_interaction = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error"))
+
+syst.output <- rbind(syst_output_W1A, syst_output_W1B, syst_output_W4)
+
+syst.output %>%
+  select(outcome, cor_interaction, variance_std, P_value)
+
+```
+
+# Syst_cov model
+
+## REML
+
+To estimate the rGE - we need to specify in the model that we want to calculate the correlation between the two random effects. 
+
+To do this - we first estimate Q
+[transposed(sqrt(GRM)*sqrt(ERM)) + transposed(sqrt(GRM)*sqrt(ERMtransposed)]
+
+See section 2.10 of the MTG2 manual for more details on NPD matrix bending.
+
+We can do this in mtg2 through the following steps: 
+* i. ensure positive definite kernel matrices - prerequisite for cholesky decomposition
+* ii. Cholesky decomposition
+* iii. compute Q
+
+Step i and ii are done with the following script: 
+
+**Navigate to the terminal/shell on Rossmann, and execute:**
+sbatch /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/mtg2_syst_cov_prep.txt
+
+```{bash syst_cov_prep}
+# cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+# 
+# # step i
+# ## GRM
+# ./../../../mtg2 -p IDs_IID.fam -g grm_full_out.grm_reformat -thread 80 -bend 2  # gives grm_full_out.grm_reformat.bend
+# ## ERM - psych 
+# ./../../../mtg2 -p IDs_IID.fam -g erm_dat_psych_syst -thread 80 -bend 2         # erm_dat_psych_syst.bend
+# ## ERM - soc 
+# ./../../../mtg2 -p IDs_IID.fam -g erm_dat_soc_syst -thread 80 -bend 2           # erm_dat_soc_syst.bend
+# ## ERM - built  
+# ./../../../mtg2 -p IDs_IID.fam -g erm_dat_built_syst -thread 80 -bend 2         # erm_dat_built_syst.bend
+# ## ERM - nat 
+# ./../../../mtg2 -p IDs_IID.fam -g erm_dat_nat_syst -thread 80 -bend 2           # erm_dat_nat_syst.bend
+#       
+# # step ii
+# ## GRM
+# ./../../../mtg2 -p IDs_IID.fam -g grm_full_out.grm_reformat.bend -thread 80 -chol 1 # output grm_full_out.grm_reformat.bend.chol
+# ## ERM - dem
+# ./../../../mtg2 -p IDs_IID.fam -g erm_dat_psych_syst.bend -thread 80 -chol 1        # output erm_dat_psych_syst.bend.chol
+# ## ERM - frfam 
+# ./../../../mtg2 -p IDs_IID.fam -g erm_dat_soc_syst.bend -thread 80 -chol 1          # erm_dat_soc_syst.bend.chol
+# ## ERM - health_general 
+# ./../../../mtg2 -p IDs_IID.fam -g erm_dat_built_syst.bend -thread 80 -chol 1        # erm_dat_built_syst.bend.chol
+# ## ERM - health_mental 
+# ./../../../mtg2 -p IDs_IID.fam -g erm_dat_nat_syst.bend -thread 80 -chol 1          # erm_dat_nat_syst.bend.chol
+```
+
+iii. compute Q 
+
+Create txt file with choleksy output. 
+
+Also created below is the txt files that contain all the correlation matrices for the different rGE models. 
+
+```{r loop to create pair txt files of chol files}
+# Define the list of file names
+syst_chol_file_names <- c(
+  "erm_dat_psych_syst.bend.chol",
+  "erm_dat_soc_syst.bend.chol",
+  "erm_dat_built_syst.bend.chol",
+  "erm_dat_nat_syst.bend.chol"
+)
+
+dir <- "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/"
+
+# Extract the meaningful names from file names
+syst_names <- gsub("erm_dat_|_syst\\.bend\\.chol", "", syst_chol_file_names)
+
+# Generate all pairwise combinations
+combinations <- combn(seq_along(syst_chol_file_names), 2, simplify = FALSE)
+
+# Loop through each combination and write to files
+for (pair_indices in combinations) {
+  # Get the file paths for the pair
+  pair_files <- syst_chol_file_names[pair_indices]
+
+  # Get the extracted domain names for the pair
+  pair_names <- syst_names[pair_indices]
+
+  # Create a meaningful output file name
+  output_file <- paste0(dir, paste(pair_names, collapse = "_"), ".chol")
+
+  # Write the pair vector to the file
+  write.table(pair_files, file = output_file, quote = FALSE, row.names = FALSE, col.names = FALSE, sep = "\t")
+}
+
+# Loop through each domain file name (excluding the first, which is "grm_full_out")
+for (file_name in syst_chol_file_names) {
+  # Create a pair vector with the first file and the current file
+  pair_vector <- c("grm_full_out.grm_reformat.bend.chol", file_name)
+
+  # Extract the domain-specific name for the output file
+  syst_name <- gsub("erm_dat_|_syst\\.bend\\.chol", "", file_name)
+
+  # Create the output file name
+  output_file <- paste0(dir, syst_name, ".grm.chol")
+
+  # Write the pair vector to the file
+  write.table(pair_vector, file = output_file, quote = FALSE, row.names = FALSE, col.names = FALSE, sep = "\t")
+}
+```
+
+```{r systems coavriance files}
+# syst cov files
+all_systems_cov.txt <- c("grm_full_out.grm_reformat", "erm_dat_psych_syst", "erm_dat_soc_syst", "erm_dat_built_syst", "erm_dat_nat_syst",
+                         "psych.grm.chol.matmat2", "soc.grm.chol.matmat2", "built.grm.chol.matmat2", "nat.grm.chol.matmat2",
+                         "psych_soc.chol.matmat2", "psych_built.chol.matmat2", "psych_nat.chol.matmat2", 
+                         "soc_built.chol.matmat2", "soc_nat.chol.matmat2",
+                         "built_nat.chol.matmat2" )
+
+write.table(all_systems_cov.txt, paste0(dir, "all_systems_cov.txt"), quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\t")
+```
+
+Create Q matrix and run REML 
+
+**Navigate to the terminal/shell on Rossmann, and execute:**
+sbatch /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/mtg2_syst_cov_reml.txt
+
+```{bash syst_cov_reml}
+# cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+# 
+# for chol_file in *.chol; do
+#         [[ "$chol_file" == *.bend.chol ]] && continue
+#        ./../../../mtg2 -p IDs_IID.fam -mg "$chol_file" -thread 80 -matmat 2
+# done
+# 
+# # REML 
+# ./../../../mtg2 -p IDs_IID.fam -mg all_systems_cov.txt -d pheno_W1A_IID.txt -mod 1 -thread 100 -out syst_cov_W1A.out > syst_cov_W1A.log
+# ./../../../mtg2 -p IDs_IID.fam -mg all_systems_cov.txt -d pheno_W1B_IID.txt -mod 1 -thread 100 -out syst_cov_W1B.out > syst_cov_W1B.log
+# ./../../../mtg2 -p IDs_IID.fam -mg all_systems_cov.txt -d pheno_W4_IID.txt -mod 1 -thread 100 -out syst_cov_W4.out > syst_cov_W4.log
+# 
+# # remove not needed columns from output
+# grep -vwE '(LKH|h2)' syst_cov_W1A.out > syst_cov_W1A.out2
+# grep -vwE '(LKH|h2)' syst_cov_W1B.out > syst_cov_W1B.out2
+# grep -vwE '(LKH|h2)' syst_cov_W4.out > syst_cov_W4.out2
+```
+
+## Delta output prep
+
+* ‘R’ is to get the ratio of variance
+* R 2 1 3 4 (i.e. 2 / (1 + 2 + 3 + 4))
+
+var(y) = var(e1) + var(e2) + 2cov(e1e2) + var(error)
+
+* ‘C’ is to get the correlation of covariance
+* C 5 2 3 (i.e. 5 / sqrt(2 * 3))
+* Here we have the covariance estimate first, followed by the two variances used for the covariance
+
+```{r do file for e_g_cov_reml_W1A}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_cov_W1A.do")                      # create file with this name
+cat("syst_cov_W1A.out2", "\n")               # line 1: specify the file with parameter estimates (above)
+cat(16, "\n")                                               # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # gen
+cat("R 3 1 2 4 5 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # psych
+cat("R 4 1 2 3 5 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # soc
+cat("R 5 1 2 3 4 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # built
+cat("R 6 1 2 3 4 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # nat
+cat("R 1 2 3 4 5 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # error
+cat("C 7 2 3", "\n")                                       # grm~psych
+cat("C 8 2 4", "\n")                                       # grm~soc
+cat("C 9 2 5", "\n")                                       # grm~built
+cat("C 10 2 6", "\n")                                      # grm~nat          
+cat("C 11 3 4", "\n")                                      # psych~soc        
+cat("C 12 3 5", "\n")                                      # psych~built            
+cat("C 13 3 6", "\n")                                      # psych~nat              
+cat("C 14 4 5", "\n")                                      # soc~built              
+cat("C 15 4 6", "\n")                                      # soc~nat             
+cat("C 16 5 6", "\n")                                      # built~nat             
+sink()
+```
+
+```{r do file for e_g_cov_reml_W1B}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_cov_W1B.do")                      # create file with this name
+cat("syst_cov_W1B.out2", "\n")               # line 1: specify the file with parameter estimates (above)
+cat(16, "\n")                                               # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # gen
+cat("R 3 1 2 4 5 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # psych
+cat("R 4 1 2 3 5 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # soc
+cat("R 5 1 2 3 4 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # built
+cat("R 6 1 2 3 4 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # nat
+cat("R 1 2 3 4 5 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # error
+cat("C 7 2 3", "\n")                                       # grm~psych
+cat("C 8 2 4", "\n")                                       # grm~soc
+cat("C 9 2 5", "\n")                                       # grm~built
+cat("C 10 2 6", "\n")                                      # grm~nat          
+cat("C 11 3 4", "\n")                                      # psych~soc        
+cat("C 12 3 5", "\n")                                      # psych~built            
+cat("C 13 3 6", "\n")                                      # psych~nat              
+cat("C 14 4 5", "\n")                                      # soc~built              
+cat("C 15 4 6", "\n")                                      # soc~nat             
+cat("C 16 5 6", "\n")                                      # built~nat             
+sink()
+```
+
+```{r do file for e_g_cov_reml_W4}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_cov_W4.do")                      # create file with this name
+cat("syst_cov_W4.out2", "\n")               # line 1: specify the file with parameter estimates (above)
+cat(16, "\n")                                               # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # gen
+cat("R 3 1 2 4 5 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # psych
+cat("R 4 1 2 3 5 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # soc
+cat("R 5 1 2 3 4 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # built
+cat("R 6 1 2 3 4 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # nat
+cat("R 1 2 3 4 5 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16", "\n")   # error
+cat("C 7 2 3", "\n")                                       # grm~psych
+cat("C 8 2 4", "\n")                                       # grm~soc
+cat("C 9 2 5", "\n")                                       # grm~built
+cat("C 10 2 6", "\n")                                      # grm~nat          
+cat("C 11 3 4", "\n")                                      # psych~soc        
+cat("C 12 3 5", "\n")                                      # psych~built            
+cat("C 13 3 6", "\n")                                      # psych~nat              
+cat("C 14 4 5", "\n")                                      # soc~built              
+cat("C 15 4 6", "\n")                                      # soc~nat             
+cat("C 16 5 6", "\n")                                      # built~nat             
+sink()
+```
+
+Output using Delta
+
+```{bash output for syst_cov}
+cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+     ./../../../mtg2 -delta2 syst_cov_W1A.do > syst_cov_W1A.out3
+     ./../../../mtg2 -delta2 syst_cov_W1B.do > syst_cov_W1B.out3
+     ./../../../mtg2 -delta2 syst_cov_W4.do > syst_cov_W4.out3
+```
+
+## Output table
+
+```{r interaction labels}
+# rge_labels <- c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error", "All covariance",
+#                     "Genetic ~ Psychological", "Genetic ~ Social", "Genetic ~ Built", "Genetic ~ Natural", 
+#                     "Psychological ~ Social", "Psychological ~ Built", "Psychological ~ Natural",
+#                     "Social ~ Built", "Social ~ Natural", 
+#                     "Built ~ Natural") 
+```
+
+```{r output table for health w g}
+syst_cov_output_W1A <- extract_delta_output(
+  outcome = "W1A",
+  model_prefix = "syst_cov",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error")
+)
+
+# # add cor description
+# syst_cov_output_W1A <- syst_cov_output_W1A %>%
+#   mutate(cor = rge_labels)
+
+syst_cov_output_W1B <- extract_delta_output(
+  outcome = "W1B",
+  model_prefix = "syst_cov",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error")
+)
+
+# # add cor description
+# syst_cov_output_W1B <- syst_cov_output_W1B %>%
+#   mutate(cor = rge_labels)
+
+syst_cov_output_W4 <- extract_delta_output(
+  outcome = "W4",
+  model_prefix = "syst_cov",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error")
+)
+
+# # add cor description
+# syst_cov_output_W4 <- syst_cov_output_W4 %>%
+#   mutate(cor = rge_labels)
+
+syst_cov.output <- rbind(syst_cov_output_W1A, syst_cov_output_W1B, syst_cov_output_W4)
+syst_cov.output %>% select(outcome, domain, parameter, variance_std, flag_corr_out_of_bounds)
+syst_cov.output %>% select(parameter, correlation_r)
+```
+
+```{r output}
+syst.output
+syst_cov.output
+```
+
+Significant and not out of bounds: 
+
+W1A	psych ~ soc		
+W1B	grm ~ psych	
+W1B	psych ~ soc		
+W4	psych ~ soc		
+
+# Drop OOB cor
+
+```{r systems coavriance files}
+# syst cov files
+systems_cov_OOB_W1A.txt <- c("grm_full_out.grm_reformat", "erm_dat_psych_syst", "erm_dat_soc_syst", "erm_dat_built_syst", "erm_dat_nat_syst",
+                         "psych_soc.chol.matmat2")
+
+write.table(systems_cov_OOB_W1A.txt, paste0(dir, "systems_cov_OOB_W1A.txt"), quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\t")
+
+systems_cov_OOB_W1B.txt <- c("grm_full_out.grm_reformat", "erm_dat_psych_syst", "erm_dat_soc_syst", "erm_dat_built_syst", "erm_dat_nat_syst",
+                         "psych.grm.chol.matmat2",
+                         "psych_soc.chol.matmat2")
+
+write.table(systems_cov_OOB_W1B.txt, paste0(dir, "systems_cov_OOB_W1B.txt"), quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\t")
+
+systems_cov_OOB_W4.txt <- c("grm_full_out.grm_reformat", "erm_dat_psych_syst", "erm_dat_soc_syst", "erm_dat_built_syst", "erm_dat_nat_syst",
+                         "psych_soc.chol.matmat2")
+
+write.table(systems_cov_OOB_W4.txt, paste0(dir, "systems_cov_OOB_W4.txt"), quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\t")
+```
+
+Create Q matrix and run REML 
+
+**Navigate to the terminal/shell on Rossmann, and execute:**
+sbatch /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/mtg2_syst_cov_reml.txt
+
+```{bash syst_cov_reml}
+# cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+# 
+# # REML 
+# ./../../../mtg2 -p IDs_IID.fam -mg systems_cov_OOB_W1A.txt -d pheno_W1A_IID.txt -mod 1 -thread 100 -out syst_cov_OOB_W1A.out > syst_cov_OOB_W1A.log
+# ./../../../mtg2 -p IDs_IID.fam -mg systems_cov_OOB_W1B.txt -d pheno_W1B_IID.txt -mod 1 -thread 100 -out syst_cov_OOB_W1B.out > syst_cov_OOB_W1B.log
+# ./../../../mtg2 -p IDs_IID.fam -mg systems_cov_OOB_W4.txt -d pheno_W4_IID.txt -mod 1 -thread 100 -out syst_cov_OOB_W4.out > syst_cov_OOB_W4.log
+# 
+# # remove not needed columns from output
+# grep -vwE '(LKH|h2)' syst_cov_OOB_W1A.out > syst_cov_OOB_W1A.out2
+# grep -vwE '(LKH|h2)' syst_cov_OOB_W1B.out > syst_cov_OOB_W1B.out2
+# grep -vwE '(LKH|h2)' syst_cov_OOB_W4.out > syst_cov_OOB_W4.out2
+```
+
+## Delta output prep
+
+* ‘R’ is to get the ratio of variance
+* R 2 1 3 4 (i.e. 2 / (1 + 2 + 3 + 4))
+
+var(y) = var(e1) + var(e2) + 2cov(e1e2) + var(error)
+
+* ‘C’ is to get the correlation of covariance
+* C 5 2 3 (i.e. 5 / sqrt(2 * 3))
+* Here we have the covariance estimate first, followed by the two variances used for the covariance
+
+```{r do file for e_g_cov_reml_W1A}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_cov_OOB_W1A.do")                      # create file with this name
+cat("syst_cov_OOB_W1A.out2", "\n")               # line 1: specify the file with parameter estimates (above)
+cat(7, "\n")                                               # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 7", "\n")   # gen
+cat("R 3 1 2 4 5 6 7 7", "\n")   # psych
+cat("R 4 1 2 3 5 6 7 7", "\n")   # soc
+cat("R 5 1 2 3 4 6 7 7", "\n")   # built
+cat("R 6 1 2 3 4 6 7 7", "\n")   # nat
+cat("R 1 2 3 4 5 6 7 7", "\n")   # error
+cat("C 7 3 4", "\n")             # psych~soc        
+sink()
+```
+
+```{r do file for e_g_cov_reml_W1B}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_cov_OOB_W1B.do")                      # create file with this name
+cat("syst_cov_OOB_W1B.out2", "\n")               # line 1: specify the file with parameter estimates (above)
+cat(8, "\n")                                               # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 7 8 8", "\n")   # gen
+cat("R 3 1 2 4 5 6 7 7 8 8", "\n")   # psych
+cat("R 4 1 2 3 5 6 7 7 8 8", "\n")   # soc
+cat("R 5 1 2 3 4 6 7 7 8 8", "\n")   # built
+cat("R 6 1 2 3 4 6 7 7 8 8", "\n")   # nat
+cat("R 1 2 3 4 5 6 7 7 8 8", "\n")   # error
+cat("C 7 2 3", "\n")                 # grm~psych
+cat("C 8 3 4", "\n")                 # psych~soc        
+sink()
+```
+
+```{r do file for e_g_cov_reml_W4}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_cov_OOB_W4.do")                      # create file with this name
+cat("syst_cov_OOB_W4.out2", "\n")               # line 1: specify the file with parameter estimates (above)
+cat(7, "\n")                                               # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 7", "\n")   # gen
+cat("R 3 1 2 4 5 6 7 7", "\n")   # psych
+cat("R 4 1 2 3 5 6 7 7", "\n")   # soc
+cat("R 5 1 2 3 4 6 7 7", "\n")   # built
+cat("R 6 1 2 3 4 6 7 7", "\n")   # nat
+cat("R 1 2 3 4 5 6 7 7", "\n")   # error
+cat("C 7 3 4", "\n")             # psych~soc        
+sink()
+```
+
+Output using Delta
+
+```{bash output for syst_cov}
+cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+     ./../../../mtg2 -delta2 syst_cov_OOB_W1A.do > syst_cov_OOB_W1A.out3
+     ./../../../mtg2 -delta2 syst_cov_OOB_W1B.do > syst_cov_OOB_W1B.out3
+     ./../../../mtg2 -delta2 syst_cov_OOB_W4.do > syst_cov_OOB_W4.out3
+```
+
+## Output table
+
+```{r interaction labels}
+rge_labels_OOB_W1A <- c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error", "All covariance",
+                    "Genetic ~ Social") 
+
+rge_labels_OOB_W1B <- c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error", "All covariance",
+                    "Genetic ~ Psychological",
+                    "Psychological ~ Social") 
+
+rge_labels_OOB_W4 <- c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error", "All covariance",
+                    "Psychological ~ Social") 
+```
+
+```{r output table for health w g}
+syst_cov_output_OOB_W1A <- extract_delta_output(
+  outcome = "W1A",
+  model_prefix = "syst_cov_OOB",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error")
+)
+
+# add cor description
+syst_cov_output_OOB_W1A <- syst_cov_output_OOB_W1A %>%
+  mutate(cor_interaction = rge_labels_OOB_W1A)
+
+syst_cov_output_OOB_W1B <- extract_delta_output(
+  outcome = "W1B",
+  model_prefix = "syst_cov_OOB",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error")
+)
+
+# add cor description
+syst_cov_output_OOB_W1B <- syst_cov_output_OOB_W1B %>%
+  mutate(cor_interaction = rge_labels_OOB_W1B)
+
+syst_cov_output_OOB_W4 <- extract_delta_output(
+  outcome = "W4",
+  model_prefix = "syst_cov_OOB",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", "Error")
+)
+
+# add cor description
+syst_cov_output_OOB_W4 <- syst_cov_output_OOB_W4 %>%
+  mutate(cor_interaction = rge_labels_OOB_W4)
+
+syst_cov_OOB.output <- rbind(syst_cov_output_OOB_W1A, syst_cov_output_OOB_W1B, syst_cov_output_OOB_W4)
+syst_cov_OOB.output
+
+syst_cov_OOB.output %>%
+  select(outcome, cor_interaction, variance_std, correlation_r, P_value)
+```
+
+## LRT
+
+```{r LRT reduced E covE}
+LRT_syst_cov_W1A <- LRT(path_full = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_cov_OOB_W1A.out", 
+                           path_constrained = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_W1A.out",
+                           Outcome = "W1A",
+                           Comparison = "Systems compared to Systems cov",
+                           df = 1)
+
+LRT_syst_cov_W1B <- LRT(path_full = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_cov_OOB_W1B.out", 
+                           path_constrained = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_W1B.out",
+                           Outcome = "W1B",
+                           Comparison = "Systems compared to Systems cov",
+                           df = 2) # two covariance parameters included
+
+LRT_syst_cov_W4 <- LRT(path_full = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_cov_OOB_W4.out", 
+                           path_constrained = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_W4.out",
+                           Outcome = "W4",
+                           Comparison = "Systems compared to Systems cov",
+                           df = 1)
+
+LRT_syst_cov <- rbind(LRT_syst_cov_W1A, LRT_syst_cov_W1B, LRT_syst_cov_W4)
+LRT_syst_cov
+```
+
+***
+
+# Syst_gxe model 
+
+## Create systems with no pca
+
+Match the domain data with NO PCA to the N in the files 
+
+```{r match IDs for no pca domain files}
+df_list <- list(
+  psych = psych_syst,
+  soc = soc_syst, 
+  built = built_syst,
+  nat = nat_syst
+)
+
+for(name in names(df_list)) {
+  file <- df_list[[name]]
+
+# Apply corrections (filter and attach ID variable) - removed to include full sample
+filtered_df <- file %>%
+  filter(AID %in% ALL_matching_ids_nosibs$AID)   # Filter based on matching IDs
+
+# make sure all are numeric 
+filtered_df <- filtered_df %>%
+  mutate(across(-AID, ~ as.numeric(.)))
+
+# take out ID 
+filtered_df_noID <- as.matrix(filtered_df[,-1]) 
+
+# scale the data
+filtered_df_scaled <- scale(filtered_df_noID) # normalise this matrix - minus the mean and divide by SD 
+
+# Need to remove any NA values
+filtered_df_scaled <- as.data.frame(filtered_df_scaled) %>% select(where(~ !all(is.na(.))))
+
+# make into matrix
+filtered_df_scaled <- as.matrix(filtered_df_scaled)
+
+# get number of variables
+m <- dim(filtered_df_scaled)[2] # m is the number of variables - NOW 395
+
+# divide by sqrt(m)
+filtered_df_scaled <- filtered_df_scaled/sqrt(m)
+
+head(as.data.frame(filtered_df_scaled))
+
+# attach additional AID variable - mtg 
+filtered_df_scaled <- cbind(filtered_df$AID, filtered_df$AID, filtered_df_scaled)
+
+# Convert to numeric matrix (ensures all values are numeric)
+filtered_numeric <- as.data.frame(filtered_df_scaled) %>% rename(AID2 = V2, AID = V1) 
+
+filtered_numeric <- filtered_numeric[, colSums(!is.na(filtered_numeric)) > 0]
+
+# Reorder the file to match the ID file
+filtered_reordered <- filtered_numeric[order(match(filtered_numeric$AID, as.numeric(matching_id_grm_erm$AID))), ]
+
+# Save the current dataframe to a file
+  temp_filename <- file.path(paste0("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/dat_nopca_", name, ".txt"))
+  write.table(filtered_reordered, temp_filename, row.names = FALSE, col.names = FALSE, quote = FALSE, sep="\t")
+}
+```
+
+## Create interaction files 
+
+**Navigate to the terminal/shell on Rossmann, and execute:**
+sbatch /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/mtg2_domexe_sub.txt
+
+You can then run the following to check it's status:
+squeue -u thom1336
+
+This will run the following as a job on Rossmann:
+
+```{bash create interaction files}
+# cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+#  
+#      # Step 1: Run all ERM commands for all files first
+#      ./../../../mtg2 -p IDs_IID.fam -pdmx dat_nopca_psych.txt -thread 100 -out psych_nopca.e
+#      ./../../../mtg2 -p IDs_IID.fam -pdmx dat_nopca_soc.txt -thread 100 -out soc_nopca.e
+#      ./../../../mtg2 -p IDs_IID.fam -pdmx dat_nopca_built.txt -thread 100 -out built_nopca.e
+#      ./../../../mtg2 -p IDs_IID.fam -pdmx dat_nopca_nat.txt -thread 100 -out nat_nopca.e
+#      
+#      # create interaction term from erm x erm for each domain combination 
+#      paste psych_nopca.e soc_nopca.e | awk '{ print $1, $2, $3 * $7 }' > psych_soc.exe
+#      paste psych_nopca.e built_nopca.e | awk '{ print $1, $2, $3 * $7 }' > psych_built.exe
+#      paste psych_nopca.e nat_nopca.e | awk '{ print $1, $2, $3 * $7 }' > psych_nat.exe
+#      
+#      paste soc_nopca.e built_nopca.e | awk '{ print $1, $2, $3 * $7 }' > soc_built.exe
+#      paste soc_nopca.e nat_nopca.e | awk '{ print $1, $2, $3 * $7 }' > soc_nat.exe
+#      
+#      paste built_nopca.e nat_nopca.e | awk '{ print $1, $2, $3 * $7 }' > built_nat.exe
+#      
+#      # create interaction term from domE x grm 
+#      paste psych_nopca.e grm_full_out.grm_reformat | awk '{ print $1, $2, $3 * $7 }' > psych_grm.gxe
+#      paste soc_nopca.e grm_full_out.grm_reformat | awk '{ print $1, $2, $3 * $7 }' > soc_grm.gxe
+#      paste built_nopca.e grm_full_out.grm_reformat | awk '{ print $1, $2, $3 * $7 }' > built_grm.gxe
+#      paste nat_nopca.e grm_full_out.grm_reformat | awk '{ print $1, $2, $3 * $7 }' > nat_grm.gxe
+#      
+#  done
+```
+
+## Create lists of interactions
+
+Create txt files with lists of domain interactions.
+
+```{r create e_g txt file}
+# all interactions 
+gxe_ALL <- c("grm_full_out.grm_reformat", "erm_dat_psych_syst", "erm_dat_soc_syst", "erm_dat_built_syst", "erm_dat_nat_syst",
+                         "psych_grm.gxe", "soc_grm.gxe", "built_grm.gxe", "nat_grm.gxe",
+                         "psych_soc.exe", "psych_built.exe", "psych_nat.exe", 
+                         "soc_built.exe", "soc_nat.exe",
+                         "built_nat.exe") 
+
+write.table(gxe_ALL, "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/gxe_ALL.txt", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\t")
+```
+
+## REML
+
+**Navigate to the terminal/shell on Rossmann, and execute:**
+sbatch /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/mtg2_syst_gxe_reml.txt
+
+You can then run the following to check it's status:
+squeue -u thom1336
+
+This will run the following as a job on Rossmann:
+
+```{bash syst_gxe_reml}
+# cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+#      
+# # REML
+#      ./../../../mtg2 -p IDs_IID.fam -mg gxe_ALL.txt -d pheno_W1A_IID.txt -cc covariate_cat_IID.txt –qc covariate_cont_IID.txt -mod 1 -thread 100 -out syst_gxe_W1A.out > syst_gxe_W1A.log
+#      ./../../../mtg2 -p IDs_IID.fam -mg gxe_ALL.txt -d pheno_W1B_IID.txt -cc covariate_cat_IID.txt –qc covariate_cont_IID.txt -mod 1 -thread 100 -out syst_gxe_W1B.out > syst_gxe_W1B.log
+#      ./../../../mtg2 -p IDs_IID.fam -mg gxe_ALL.txt -d pheno_W4_IID.txt -cc covariate_cat_IID.txt –qc covariate_cont_IID.txt -mod 1 -thread 100 -out  syst_gxe_W4.out >  syst_gxe_W4.log
+#      
+```
+
+## Delta output prep 
+
+```{bash pick out LKH}
+cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+
+grep -vwE '(LKH|h2)' syst_gxe_W1A.out > syst_gxe_W1A.out2
+grep -vwE '(LKH|h2)' syst_gxe_W1B.out > syst_gxe_W1B.out2
+grep -vwE '(LKH|h2)' syst_gxe_W4.out > syst_gxe_W4.out2
+```
+
+```{r do file for syst_gxe_W1A}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_gxe_W1A.do")          # create file with this name
+cat("syst_gxe_W1A.out2", "\n")   # line 1: specify the file with parameter estimates (above)
+cat(16, "\n")                         # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 8 9 10 11 12 13 14 15 16", "\n")               # line 3: compute prop. of variance due to grm
+cat("R 3 1 2 4 5 6 7 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to psych
+cat("R 4 1 2 3 5 6 7 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to soc
+cat("R 5 1 2 3 4 6 7 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to built
+cat("R 6 1 2 3 4 5 7 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to nat
+cat("R 7 1 2 3 4 5 6 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to psych_grm.gxe
+cat("R 8 1 2 3 4 5 6 7 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to soc_grm.gxe 
+cat("R 9 1 2 3 4 5 6 7 8 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to built_grm.gxe 
+cat("R 10 1 2 3 4 5 6 7 8 9 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to nat_grm.gxe 
+cat("R 11 1 2 3 4 5 6 7 8 9 10 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to psych_soc.exe 
+cat("R 12 1 2 3 4 5 6 7 8 9 10 11 13 14 15 16", "\n")               # line 4: compute prop. of variance due to psych_built.exe 
+cat("R 13 1 2 3 4 5 6 7 8 9 10 11 12 14 15 16", "\n")               # line 4: compute prop. of variance due to psych_nat.exe 
+cat("R 14 1 2 3 4 5 6 7 8 9 10 11 12 13 15 16", "\n")               # line 4: compute prop. of variance due to soc_built.exe
+cat("R 15 1 2 3 4 5 6 7 8 9 10 11 12 13 14 16", "\n")               # line 4: compute prop. of variance due to soc_nat.exe
+cat("R 16 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15", "\n")               # line 4: compute prop. of variance due to built_nat.exe
+cat("R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to error
+sink()
+```
+
+```{r do file for syst_gxe_W1B}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_gxe_W1B.do")          # create file with this name
+cat("syst_gxe_W1B.out2", "\n")   # line 1: specify the file with parameter estimates (above)
+cat(16, "\n")                         # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 8 9 10 11 12 13 14 15 16", "\n")               # line 3: compute prop. of variance due to grm
+cat("R 3 1 2 4 5 6 7 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to psych
+cat("R 4 1 2 3 5 6 7 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to soc
+cat("R 5 1 2 3 4 6 7 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to built
+cat("R 6 1 2 3 4 5 7 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to nat
+cat("R 7 1 2 3 4 5 6 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to psych_grm.gxe
+cat("R 8 1 2 3 4 5 6 7 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to soc_grm.gxe 
+cat("R 9 1 2 3 4 5 6 7 8 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to built_grm.gxe 
+cat("R 10 1 2 3 4 5 6 7 8 9 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to nat_grm.gxe 
+cat("R 11 1 2 3 4 5 6 7 8 9 10 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to psych_soc.exe 
+cat("R 12 1 2 3 4 5 6 7 8 9 10 11 13 14 15 16", "\n")               # line 4: compute prop. of variance due to psych_built.exe 
+cat("R 13 1 2 3 4 5 6 7 8 9 10 11 12 14 15 16", "\n")               # line 4: compute prop. of variance due to psych_nat.exe 
+cat("R 14 1 2 3 4 5 6 7 8 9 10 11 12 13 15 16", "\n")               # line 4: compute prop. of variance due to soc_built.exe
+cat("R 15 1 2 3 4 5 6 7 8 9 10 11 12 13 14 16", "\n")               # line 4: compute prop. of variance due to soc_nat.exe
+cat("R 16 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15", "\n")               # line 4: compute prop. of variance due to built_nat.exe
+cat("R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to error
+sink()
+```
+
+```{r do file for syst_gxe_W4}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_gxe_W4.do")          # create file with this name
+cat("syst_gxe_W4.out2", "\n")   # line 1: specify the file with parameter estimates (above)
+cat(16, "\n")                         # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 8 9 10 11 12 13 14 15 16", "\n")               # line 3: compute prop. of variance due to grm
+cat("R 3 1 2 4 5 6 7 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to psych
+cat("R 4 1 2 3 5 6 7 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to soc
+cat("R 5 1 2 3 4 6 7 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to built
+cat("R 6 1 2 3 4 5 7 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to nat
+cat("R 7 1 2 3 4 5 6 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to psych_grm.gxe
+cat("R 8 1 2 3 4 5 6 7 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to soc_grm.gxe 
+cat("R 9 1 2 3 4 5 6 7 8 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to built_grm.gxe 
+cat("R 10 1 2 3 4 5 6 7 8 9 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to nat_grm.gxe 
+cat("R 11 1 2 3 4 5 6 7 8 9 10 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to psych_soc.exe 
+cat("R 12 1 2 3 4 5 6 7 8 9 10 11 13 14 15 16", "\n")               # line 4: compute prop. of variance due to psych_built.exe 
+cat("R 13 1 2 3 4 5 6 7 8 9 10 11 12 14 15 16", "\n")               # line 4: compute prop. of variance due to psych_nat.exe 
+cat("R 14 1 2 3 4 5 6 7 8 9 10 11 12 13 15 16", "\n")               # line 4: compute prop. of variance due to soc_built.exe
+cat("R 15 1 2 3 4 5 6 7 8 9 10 11 12 13 14 16", "\n")               # line 4: compute prop. of variance due to soc_nat.exe
+cat("R 16 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15", "\n")               # line 4: compute prop. of variance due to built_nat.exe
+cat("R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16", "\n")               # line 4: compute prop. of variance due to error
+sink()
+```
+
+Output using Delta
+
+```{bash output for e_g_gxe_reml}
+cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+    
+./../../../mtg2 -delta2 syst_gxe_W1A.do > syst_gxe_W1A.out3
+./../../../mtg2 -delta2 syst_gxe_W1B.do > syst_gxe_W1B.out3
+./../../../mtg2 -delta2 syst_gxe_W4.do > syst_gxe_W4.out3
+```
+
+## Output table 
+
+```{r interaction labels}
+gxe_labels <- c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment",
+                    "grm x psych", "grm x soc", "grm x built", "grm x nat", 
+                    "psych x soc", "psych x built", "psych x nat",
+                    "soc x built", "soc x nat", 
+                    "built x nat", 
+                    "Error") 
+```
+                         
+```{r output for dropped domains}
+# W1A
+syst_gxe_W1A.output <- extract_delta_output(
+  outcome = "W1A",
+  model_prefix = "syst_gxe",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", 
+                    rep("Gene-environment interaction", 4), 
+                    rep("Environment-environment interaction", 6),
+                    "Error")
+)
+
+# add interaction description
+syst_gxe_W1A.output <- syst_gxe_W1A.output %>%
+  mutate(interaction = gxe_labels)
+
+# W1B
+syst_gxe_W1B.output <- extract_delta_output(
+  outcome = "W1B",
+  model_prefix = "syst_gxe",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", 
+                    rep("Gene-environment interaction", 4), 
+                    rep("Environment-environment interaction", 6),
+                    "Error")
+)
+
+# add interaction description
+syst_gxe_W1B.output <- syst_gxe_W1B.output %>%
+  mutate(interaction = gxe_labels)
+
+# W4
+syst_gxe_W4.output <- extract_delta_output(
+  outcome = "W4",
+  model_prefix = "syst_gxe",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", 
+                    rep("Gene-environment interaction", 4), 
+                    rep("Environment-environment interaction", 6),
+                    "Error")
+)
+
+# add interaction description
+syst_gxe_W4.output <- syst_gxe_W4.output %>%
+  mutate(interaction = gxe_labels)
+
+# combine
+syst_gxe.output <- rbind(syst_gxe_W1A.output, syst_gxe_W1B.output, syst_gxe_W4.output)
+
+# contribution
+syst_gxe.output %>%
+  mutate(contribution = variance_std/variance_std_tot*100)
+
+# significant interaction
+syst_gxe.output %>%
+  filter((domain == "Environment-environment interaction" | domain == "Gene-environment interaction")
+           & flag_neg_variance == "FALSE"
+           & P_value < 0.05
+           ) %>% 
+  select(outcome, interaction, variance_std, P_value)
+```
+
+W1A	grm x psych	
+W1A	grm x soc	
+W1B	grm x psych	
+W1B	grm x soc		
+W4	grm x psych
+
+# Drop OOB gxe
+
+## Create lists of interactions
+
+Create txt files with lists of domain interactions.
+
+```{r create e_g txt file}
+# all interactions 
+gxe_W1A <- c("grm_full_out.grm_reformat", "erm_dat_psych_syst", "erm_dat_soc_syst", "erm_dat_built_syst", "erm_dat_nat_syst",
+                         "psych_grm.gxe", "soc_grm.gxe") 
+
+write.table(gxe_W1A, "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/gxe_W1A.txt", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\t")
+
+# all interactions 
+gxe_W1B <- c("grm_full_out.grm_reformat", "erm_dat_psych_syst", "erm_dat_soc_syst", "erm_dat_built_syst", "erm_dat_nat_syst",
+                         "psych_grm.gxe", "soc_grm.gxe") 
+
+write.table(gxe_W1B, "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/gxe_W1B.txt", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\t")
+
+# all interactions 
+gxe_W4 <- c("grm_full_out.grm_reformat", "erm_dat_psych_syst", "erm_dat_soc_syst", "erm_dat_built_syst", "erm_dat_nat_syst",
+                         "psych_grm.gxe") 
+
+write.table(gxe_W4, "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/gxe_W4.txt", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\t")
+```
+
+## REML
+
+**Navigate to the terminal/shell on Rossmann, and execute:**
+sbatch /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/mtg2_syst_gxe_reml.txt
+
+You can then run the following to check it's status:
+squeue -u thom1336
+
+This will run the following as a job on Rossmann:
+
+```{bash mtg2_syst_gxe_reml}
+# cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+#      
+# # REML
+#  ./../../../mtg2 -p IDs_IID.fam -mg gxe_W1A.txt -d pheno_W1A_IID.txt -cc covariate_cat_IID.txt –qc covariate_cont_IID.txt -mod 1 -thread 100 -out syst_gxe_OOB_W1A.out > syst_gxe_OOB_W1A.log
+#  ./../../../mtg2 -p IDs_IID.fam -mg gxe_W1B.txt -d pheno_W1B_IID.txt -cc covariate_cat_IID.txt –qc covariate_cont_IID.txt -mod 1 -thread 100 -out syst_gxe_OOB_W1B.out > syst_gxe_OOB_W1B.log
+#  ./../../../mtg2 -p IDs_IID.fam -mg gxe_W4.txt -d pheno_W4_IID.txt -cc covariate_cat_IID.txt –qc covariate_cont_IID.txt -mod 1 -thread 100 -out  syst_gxe_OOB_W4.out >  syst_gxe_OOB_W4.log
+```
+
+## Delta output prep 
+
+```{bash pick out LKH}
+cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+
+grep -vwE '(LKH|h2)' syst_gxe_OOB_W1A.out > syst_gxe_OOB_W1A.out2
+grep -vwE '(LKH|h2)' syst_gxe_OOB_W1B.out > syst_gxe_OOB_W1B.out2
+grep -vwE '(LKH|h2)' syst_gxe_OOB_W4.out > syst_gxe_OOB_W4.out2
+```
+
+```{r do file for syst_gxe_W1A}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_gxe_OOB_W1A.do")          # create file with this name
+cat("syst_gxe_OOB_W1A.out2", "\n")   # line 1: specify the file with parameter estimates (above)
+cat(8, "\n")                         # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 8", "\n")               # line 3: compute prop. of variance due to grm
+cat("R 3 1 2 4 5 6 7 8", "\n")               # line 4: compute prop. of variance due to psych
+cat("R 4 1 2 3 5 6 7 8", "\n")               # line 4: compute prop. of variance due to soc
+cat("R 5 1 2 3 4 6 7 8", "\n")               # line 4: compute prop. of variance due to built
+cat("R 6 1 2 3 4 5 7 8", "\n")               # line 4: compute prop. of variance due to nat
+cat("R 7 1 2 3 4 5 6 8", "\n")               # line 4: compute prop. of variance due to psych_grm.gxe
+cat("R 8 1 2 3 4 5 6 7", "\n")               # line 4: compute prop. of variance due to soc_grm.gxe 
+cat("R 1 2 3 4 5 6 7 8", "\n")               # line 4: compute prop. of variance due to error
+sink()
+```
+
+```{r do file for syst_gxe_W1B}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_gxe_OOB_W1B.do")          # create file with this name
+cat("syst_gxe_OOB_W1B.out2", "\n")   # line 1: specify the file with parameter estimates (above)
+cat(8, "\n")                         # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 8", "\n")               # line 3: compute prop. of variance due to grm
+cat("R 3 1 2 4 5 6 7 8", "\n")               # line 4: compute prop. of variance due to psych
+cat("R 4 1 2 3 5 6 7 8", "\n")               # line 4: compute prop. of variance due to soc
+cat("R 5 1 2 3 4 6 7 8", "\n")               # line 4: compute prop. of variance due to built
+cat("R 6 1 2 3 4 5 7 8", "\n")               # line 4: compute prop. of variance due to nat
+cat("R 7 1 2 3 4 5 6 8", "\n")               # line 4: compute prop. of variance due to psych_grm.gxe
+cat("R 8 1 2 3 4 5 6 7", "\n")               # line 4: compute prop. of variance due to soc_grm.gxe 
+cat("R 1 2 3 4 5 6 7 8", "\n")               # line 4: compute prop. of variance due to error
+sink()
+```
+
+```{r do file for syst_gxe_W4}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_gxe_OOB_W4.do")          # create file with this name
+cat("syst_gxe_OOB_W4.out2", "\n")   # line 1: specify the file with parameter estimates (above)
+cat(7, "\n")                         # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7", "\n")               # line 3: compute prop. of variance due to grm
+cat("R 3 1 2 4 5 6 7", "\n")               # line 4: compute prop. of variance due to psych
+cat("R 4 1 2 3 5 6 7", "\n")               # line 4: compute prop. of variance due to soc
+cat("R 5 1 2 3 4 6 7", "\n")               # line 4: compute prop. of variance due to built
+cat("R 6 1 2 3 4 5 7", "\n")               # line 4: compute prop. of variance due to nat
+cat("R 7 1 2 3 4 5 6", "\n")               # line 4: compute prop. of variance due to psych_grm.gxe
+cat("R 1 2 3 4 5 6 7", "\n")               # line 4: compute prop. of variance due to error
+sink()
+```
+
+Output using Delta
+
+```{bash output for e_g_gxe_reml}
+cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+    
+./../../../mtg2 -delta2 syst_gxe_OOB_W1A.do > syst_gxe_OOB_W1A.out3
+./../../../mtg2 -delta2 syst_gxe_OOB_W1B.do > syst_gxe_OOB_W1B.out3
+./../../../mtg2 -delta2 syst_gxe_OOB_W4.do > syst_gxe_OOB_W4.out3
+```
+
+## Output table 
+
+```{r interaction labels}
+gxe_labels_W1A <- c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment",
+                    "Genetic x Psychological", "Genetic x Social",
+                    "Error") 
+
+gxe_labels_W1B <- c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment",
+                    "Genetic x Psychological", "Genetic x Social", 
+                    "Error") 
+
+gxe_labels_W4 <- c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment",
+                    "Genetic x Psychological",
+                    "Error") 
+```
+                         
+```{r output for dropped domains}
+# W1A
+syst_gxe_OOB_W1A.output <- extract_delta_output(
+  outcome = "W1A",
+  model_prefix = "syst_gxe_OOB",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", 
+                    rep("Gene-environment interaction", 2), 
+                    "Error")
+)
+
+# add interaction description
+syst_gxe_OOB_W1A.output <- syst_gxe_OOB_W1A.output %>%
+  mutate(cor_interaction = gxe_labels_W1A)
+
+# W1B
+syst_gxe_OOB_W1B.output <- extract_delta_output(
+  outcome = "W1B",
+  model_prefix = "syst_gxe_OOB",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", 
+                    rep("Gene-environment interaction", 2), 
+                    "Error")
+)
+
+# add interaction description
+syst_gxe_OOB_W1B.output <- syst_gxe_OOB_W1B.output %>%
+  mutate(cor_interaction = gxe_labels_W1B)
+
+# W4
+syst_gxe_OOB_W4.output <- extract_delta_output(
+  outcome = "W4",
+  model_prefix = "syst_gxe_OOB",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", 
+                    "Gene-environment interaction", 
+                    "Error")
+)
+
+# add interaction description
+syst_gxe_OOB_W4.output <- syst_gxe_OOB_W4.output %>%
+  mutate(cor_interaction = gxe_labels_W4)
+
+# combine
+syst_gxe_OOB.output <- rbind(syst_gxe_OOB_W1A.output, syst_gxe_OOB_W1B.output, syst_gxe_OOB_W4.output)
+
+# contribution
+syst_gxe_OOB.output %>%
+  mutate(contribution = variance_std/variance_std_tot*100)
+
+# significant interaction
+syst_gxe_OOB.output %>%
+  filter((domain == "Environment-environment interaction" | domain == "Gene-environment interaction")
+           & flag_neg_variance == "FALSE"
+           & P_value < 0.05
+           ) %>% 
+  select(outcome, cor_interaction, variance_std, P_value)
+```
+
+## LRT
+
+```{r LRT reduced E covE}
+LRT_syst_gxe_W1A <- LRT(path_full = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_gxe_OOB_W1A.out", 
+                           path_constrained = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_W1A.out",
+                           Outcome = "W1A",
+                           Comparison = "Systems compared to Systems gxe",
+                           df = 2)
+
+LRT_syst_gxe_W1B <- LRT(path_full = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_gxe_OOB_W1B.out", 
+                           path_constrained = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_W1B.out",
+                           Outcome = "W1B",
+                           Comparison = "Systems compared to Systems gxe",
+                           df = 2) # two covariance parameters included
+
+LRT_syst_gxe_W4 <- LRT(path_full = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_gxe_OOB_W4.out", 
+                           path_constrained = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_W4.out",
+                           Outcome = "W4",
+                           Comparison = "Systems compared to Systems gxe",
+                           df = 1)
+
+LRT_syst_gxe <- rbind(LRT_syst_gxe_W1A, LRT_syst_gxe_W1B, LRT_syst_gxe_W4)
+LRT_syst_gxe
+```
+
+# Syst Gxe and rS
+
+## Lists of interactions and covariances
+
+Create txt files with lists of domain interactions with covariances.
+
+```{r create e_g txt file}
+# all interactions 
+gxe_cov_W1A <- c("grm_full_out.grm_reformat", "erm_dat_psych_syst", "erm_dat_soc_syst", "erm_dat_built_syst", "erm_dat_nat_syst",
+                         "psych_grm.gxe", "soc_grm.gxe",
+             "psych.grm.chol.matmat2", "soc.grm.chol.matmat2", 
+             "psych_soc.chol.matmat2") 
+
+write.table(gxe_cov_W1A, "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/gxe_cov_W1A.txt", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\t")
+
+# all interactions 
+gxe_cov_W1B <- c("grm_full_out.grm_reformat", "erm_dat_psych_syst", "erm_dat_soc_syst", "erm_dat_built_syst", "erm_dat_nat_syst",
+                         "psych_grm.gxe", "soc_grm.gxe",
+             "psych.grm.chol.matmat2", "soc.grm.chol.matmat2", 
+             "psych_soc.chol.matmat2") 
+
+write.table(gxe_cov_W1B, "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/gxe_cov_W1B.txt", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\t")
+
+# all interactions 
+gxe_cov_W4 <- c("grm_full_out.grm_reformat", "erm_dat_psych_syst", "erm_dat_soc_syst", "erm_dat_built_syst", "erm_dat_nat_syst",
+                         "psych_grm.gxe",
+             "psych.grm.chol.matmat2", "soc.grm.chol.matmat2", 
+             "psych_soc.chol.matmat2") 
+
+write.table(gxe_cov_W4, "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/gxe_cov_W4.txt", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\t")
+```
+
+## REML
+
+**Navigate to the terminal/shell on Rossmann, and execute:**
+sbatch /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/mtg2_syst_gxe_reml.txt
+
+You can then run the following to check it's status:
+squeue -u thom1336
+
+This will run the following as a job on Rossmann:
+
+```{bash syst_gxe_reml}
+# cd /pdfs/rche/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+#      
+# # REML
+#      ./../../../mtg2 -p IDs_IID.fam -mg gxe_cov_W1A.txt -d pheno_W1A_IID.txt -cc covariate_cat_IID.txt –qc covariate_cont_IID.txt -mod 1 -thread 100 -out syst_cov_gxe_W1A.out > syst_cov_gxe_W1A.log
+#      ./../../../mtg2 -p IDs_IID.fam -mg gxe_cov_W1B.txt -d pheno_W1B_IID.txt -cc covariate_cat_IID.txt –qc covariate_cont_IID.txt -mod 1 -thread 100 -out syst_cov_gxe_W1B.out > syst_cov_gxe_W1B.log
+#     ./../../../mtg2 -p IDs_IID.fam -mg gxe_cov_W4.txt -d pheno_W4_IID.txt -cc covariate_cat_IID.txt –qc covariate_cont_IID.txt -mod 1 -thread 100 -out  syst_cov_gxe_W4.out >  syst_cov_gxe_W4.log
+```
+
+## Delta output prep 
+
+```{bash syst_gxe_reml}
+cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+
+grep -vwE '(LKH|h2)' syst_cov_gxe_W1A.out > syst_cov_gxe_W1A.out2
+grep -vwE '(LKH|h2)' syst_cov_gxe_W1B.out > syst_cov_gxe_W1B.out2
+grep -vwE '(LKH|h2)' syst_cov_gxe_W4.out > syst_cov_gxe_W4.out2
+```
+
+```{r do file for syst_cov_gxe_W1A}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_cov_gxe_W1A.do")          # create file with this name
+cat("syst_cov_gxe_W1A.out2", "\n")   # line 1: specify the file with parameter estimates (above)
+cat(11, "\n")                         # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 8 9 9 10 10 11 11", "\n")               # line 3: compute prop. of variance due to grm
+cat("R 3 1 2 4 5 6 7 8 9 9 10 10 11 11", "\n")               # line 4: compute prop. of variance due to psych
+cat("R 4 1 2 3 5 6 7 8 9 9 10 10 11 11", "\n")               # line 4: compute prop. of variance due to soc
+cat("R 5 1 2 3 4 6 7 8 9 9 10 10 11 11", "\n")               # line 4: compute prop. of variance due to built
+cat("R 6 1 2 3 4 5 7 8 9 9 10 10 11 11", "\n")               # line 4: compute prop. of variance due to nat
+cat("R 7 1 2 3 4 5 6 8 9 9 10 10 11 11", "\n")               # line 4: compute prop. of variance due to psych_grm.gxe
+cat("R 8 1 2 3 4 5 6 7 9 9 10 10 11 11", "\n")               # line 4: compute prop. of variance due to soc_grm.gxe 
+cat("R 1 2 3 4 5 6 7 8 9 9 10 10 11 11", "\n")               # line 4: compute prop. of variance due to error
+cat("C 9 2 3", "\n")                                       # grm~psych
+cat("C 10 2 4", "\n")                                       # grm~soc
+cat("C 11 3 4", "\n")                                       # psych~soc
+sink()
+```
+
+```{r do file for syst_cov_gxe_W1B}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_cov_gxe_W1B.do")          # create file with this name
+cat("syst_cov_gxe_W1B.out2", "\n")   # line 1: specify the file with parameter estimates (above)
+cat(11, "\n")                         # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 8 9 9 10 10 11 11", "\n")               # line 3: compute prop. of variance due to grm
+cat("R 3 1 2 4 5 6 7 8 9 9 10 10 11 11", "\n")               # line 4: compute prop. of variance due to psych
+cat("R 4 1 2 3 5 6 7 8 9 9 10 10 11 11", "\n")               # line 4: compute prop. of variance due to soc
+cat("R 5 1 2 3 4 6 7 8 9 9 10 10 11 11", "\n")               # line 4: compute prop. of variance due to built
+cat("R 6 1 2 3 4 5 7 8 9 9 10 10 11 11", "\n")               # line 4: compute prop. of variance due to nat
+cat("R 7 1 2 3 4 5 6 8 9 9 10 10 11 11", "\n")               # line 4: compute prop. of variance due to psych_grm.gxe
+cat("R 8 1 2 3 4 5 6 7 9 9 10 10 11 11", "\n")               # line 4: compute prop. of variance due to soc_grm.gxe 
+cat("R 1 2 3 4 5 6 7 8 9 9 10 10 11 11", "\n")               # line 4: compute prop. of variance due to error
+cat("C 9 2 3", "\n")                                       # grm~psych
+cat("C 10 2 4", "\n")                                       # grm~soc
+cat("C 11 3 4", "\n")                                       # psych~soc
+sink()
+```
+
+```{r do file for syst_cov_gxe_W4}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_cov_gxe_W4.do")          # create file with this name
+cat("syst_cov_gxe_W4.out2", "\n")   # line 1: specify the file with parameter estimates (above)
+cat(10, "\n")                         # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 8 8 9 9 10 10", "\n")               # line 3: compute prop. of variance due to grm
+cat("R 3 1 2 4 5 6 7 8 8 9 9 10 10", "\n")               # line 4: compute prop. of variance due to psych
+cat("R 4 1 2 3 5 6 7 8 8 9 9 10 10", "\n")               # line 4: compute prop. of variance due to soc
+cat("R 5 1 2 3 4 6 7 8 8 9 9 10 10", "\n")               # line 4: compute prop. of variance due to built
+cat("R 6 1 2 3 4 5 7 8 8 9 9 10 10", "\n")               # line 4: compute prop. of variance due to nat
+cat("R 7 1 2 3 4 5 6 8 8 9 9 10 10", "\n")               # line 4: compute prop. of variance due to psych_grm.gxe
+cat("R 1 2 3 4 5 6 7 8 8 9 9 10 10", "\n")               # line 4: compute prop. of variance due to error
+cat("C 8 2 3", "\n")                                       # grm~psych
+cat("C 9 2 4", "\n")                                       # grm~soc
+cat("C 10 3 4", "\n")                                       # psych~soc
+sink()
+```
+
+Output using Delta
+
+```{bash output for e_g_gxe_reml}
+cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+    
+./../../../mtg2 -delta2 syst_cov_gxe_W1A.do > syst_cov_gxe_W1A.out3
+./../../../mtg2 -delta2 syst_cov_gxe_W1B.do > syst_cov_gxe_W1B.out3
+./../../../mtg2 -delta2 syst_cov_gxe_W4.do > syst_cov_gxe_W4.out3
+```
+
+## Output table 
+
+```{r interaction labels}
+gxe_cov_labels_W1A <- c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment",
+                    "Genetic x Psychological", "Genetic x Social",
+                    "Error",
+                    "Total covariance",
+                    "Genetic ~ Psychological", "Genetic ~ Social", "Psychological ~ Social") 
+
+gxe_cov_labels_W1B <- c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment",
+                    "Genetic x Psychological", "Genetic x Social", 
+                    "Error",
+                    "Total covariance",
+                    "Genetic ~ Psychological", "Genetic ~ Social", "Psychological ~ Social") 
+
+gxe_cov_labels_W4 <- c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment",
+                    "Genetic x Psychological",
+                    "Error",
+                    "Total covariance",
+                   "Genetic ~ Psychological", "Genetic ~ Social", "Psychological ~ Social") 
+```
+
+```{r output for dropped domains}
+# W1A
+syst_cov_gxe_W1A.output <- extract_delta_output(
+  outcome = "W1A",
+  model_prefix = "syst_cov_gxe",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", 
+                    rep("Gene-environment interaction", 2), 
+                    "Error")
+)
+
+# add interaction description
+syst_cov_gxe_W1A.output <- syst_cov_gxe_W1A.output %>%
+  mutate(cor_interaction = gxe_cov_labels_W1A)
+
+# W1B
+syst_cov_gxe_W1B.output <- extract_delta_output(
+  outcome = "W1B",
+  model_prefix = "syst_cov_gxe",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", 
+                    rep("Gene-environment interaction", 2), 
+                    "Error")
+)
+
+# add interaction description
+syst_cov_gxe_W1B.output <- syst_cov_gxe_W1B.output %>%
+  mutate(cor_interaction = gxe_cov_labels_W1B)
+
+# W4
+syst_cov_gxe_W4.output <- extract_delta_output(
+  outcome = "W4",
+  model_prefix = "syst_cov_gxe",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Psychological systems", "Social environment", "Built environment", "Natural environment", 
+                    "Gene-environment interaction", 
+                    "Error")
+)
+
+# add interaction description
+syst_cov_gxe_W4.output <- syst_cov_gxe_W4.output %>%
+  mutate(cor_interaction = gxe_cov_labels_W4)
+
+# combine
+syst_cov_gxe.output <- rbind(syst_cov_gxe_W1A.output, syst_cov_gxe_W1B.output, syst_cov_gxe_W4.output)
+syst_cov_gxe.output
+```
+
+## LRT
+
+```{r LRT reduced E covE}
+LRT_syst_cov_gxe_W1A <- LRT(path_full = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_cov_gxe_W1A.out", 
+                           path_constrained = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_gxe_OOB_W1A.out",
+                           Outcome = "W1A",
+                           Comparison = "Systems gxe compared to Systems rG & gxe",
+                           df = 3)
+
+LRT_syst_cov_gxe_W1B <- LRT(path_full = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_cov_gxe_W1B.out", 
+                           path_constrained = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_gxe_OOB_W1B.out",
+                           Outcome = "W1B",
+                           Comparison = "Systems gxe compared to Systems rG & gxe",
+                           df = 3) # two covariance parameters included
+
+LRT_syst_cov_gxe_W4 <- LRT(path_full = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_cov_gxe_W4.out", 
+                           path_constrained = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/syst_gxe_OOB_W4.out",
+                           Outcome = "W4",
+                           Comparison = "Systems gxe compared to Systems rG & gxe",
+                           df = 3)
+
+LRT_syst_cov_gxe <- rbind(LRT_syst_cov_gxe_W1A, LRT_syst_cov_gxe_W1B, LRT_syst_cov_gxe_W4)
+LRT_syst_cov_gxe
+```
+
+
+***
+
+# Output
+
+```{r output table for supplement}
+syst_output <- bind_rows(
+syst.output, 
+syst_cov.output,
+syst_cov_OOB.output,
+syst_gxe.output,
+syst_gxe_OOB.output,
+syst_cov_gxe.output
+)
+```
+
+
+# Plot
+
+```{r all domain models in one dataframe}
+syst_plot <- bind_rows(
+syst.output, 
+syst_gxe_OOB.output,
+syst_cov_gxe.output
+)
+
+syst_plot %>%
+  select(outcome, domain, )
+```
+
+```{r syst plot}
+syst_plot_update <- syst_plot %>% 
+  select(-flag_neg_variance, -flag_corr_out_of_bounds, -model, -SE) %>%
+  filter(domain != "Error" & domain != "Covariance" & domain != "Correlation") %>%
+  group_by(outcome, input) %>%
+  mutate(contribution = variance_std/variance_std_tot*100,
+         contribution_upper = CI_upper/variance_std_tot*100,
+         contribution_lower = CI_lower/variance_std_tot*100)
+  
+domain_colors <- c(
+    "#ADD8E6", # gxe
+    "#ADD8E6", # gxe
+    "#00FFD4", # nat
+    "#FFF100", # built
+    "#FD5953", # soc
+    "#FF88FF", # psych
+    "#009AFF"  # genetic
+)
+
+all_domains <- c("Genetic x Social", "Genetic x Psychological", 
+                 "Natural environment", "Built environment", "Social environment", "Psychological systems", "Genetic/Biological systems")  
+
+# Convert `domain` to a factor with consistent levels
+syst_plot_update$cor_interaction <- factor(syst_plot_update$cor_interaction, levels = all_domains)
+
+# plot
+
+syst_plot_contribution <- ggplot(syst_plot_update, aes(x = contribution, y = cor_interaction, fill = cor_interaction)) +
+  geom_col(width = 0.7, color = "black") +
+  geom_errorbarh(aes(xmin = contribution_lower, xmax = contribution_upper), height = 0.2) +
+  geom_text(
+    data = syst_plot_update %>% filter(cor_interaction == "Natural environment"),
+    aes(label = paste0("Total variance = ", scales::percent(variance_std_tot, accuracy = 1)), x = contribution + 35),
+    hjust = 0, size = 5.5, color = "black"
+  ) +
+  facet_grid(
+    rows = vars(input),
+    cols = vars(outcome),
+    scales = "free_y",
+    space = "free_y"
+  ) +
+  scale_fill_manual(values = domain_colors) +
+  labs(x = "Percentage Variance Explained", y = NULL) +
+  theme_classic(base_size = 16) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 14),
+    legend.key.width = unit(1.5, "cm"),
+    axis.title.x = element_text(size = 18, margin = margin(t = 10)),
+    axis.text.y = element_text(size = 16),
+    axis.text.x = element_text(size = 16),
+    strip.text.y = element_text(size = 16, face = "bold"),  # <-- SHOW headers for input
+    strip.text.x = element_text(size = 15),
+    strip.background.y = element_blank(),                  # <-- Remove annoying grey background
+    panel.spacing = unit(1, "lines"),
+    plot.title = element_text(size = 18, face = "bold"),
+    plot.subtitle = element_text(size = 16),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+save_gg_cairo(syst_plot_contribution,filename = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/syst_plot.png", width = 1500, height = 1000)
+
+save_gg_cairo(syst_plot_contribution, filename = "~/findmedep/figures/syst_plot.png", width = 1400, height = 800)
+```
+
+***
+
+# Sensitivity analysis - drop psych
+
+## Lists of components
+
+```{r create e_g txt file}
+# all interactions 
+sens <- c("grm_full_out.grm_reformat", "erm_dat_soc_syst", "erm_dat_built_syst", "erm_dat_nat_syst",
+             "soc_grm.gxe", "soc_built.exe", 
+             "soc.grm.chol.matmat2", "soc_built.chol.matmat2") 
+
+write.table(sens, "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/sens.txt", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\t")
+```
+
+## REML
+
+**Navigate to the terminal/shell on Rossmann, and execute:**
+sbatch /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/mtg2_syst_sens_reml.txt
+
+You can then run the following to check it's status:
+squeue -u thom1336
+
+This will run the following as a job on Rossmann:
+
+```{bash mtg2_syst_sens_reml}
+# # REML
+#     ./../../../mtg2 -p IDs_IID.fam -mg sens.txt -d pheno_W1A_IID.txt -cc covariate_cat_IID.txt –qc covariate_cont_IID.txt -mod 1 -thread 100 -out syst_sens_W1A.out > syst_sens_W1A.log
+#     ./../../../mtg2 -p IDs_IID.fam -mg sens.txt -d pheno_W1B_IID.txt -cc covariate_cat_IID.txt –qc covariate_cont_IID.txt -mod 1 -thread 100 -out syst_sens_W1B.out > syst_sens_W1B.log
+#    ./../../../mtg2 -p IDs_IID.fam -mg sens.txt -d pheno_W4_IID.txt -cc covariate_cat_IID.txt –qc covariate_cont_IID.txt -mod 1 -thread 100 -out  syst_sens_W4.out >  syst_sens_W4.log
+```
+
+## Delta output prep 
+
+```{bash pick out LKH}
+cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+
+grep -vwE '(LKH|h2)' syst_sens_W1A.out > syst_sens_W1A.out2
+grep -vwE '(LKH|h2)' syst_sens_W1B.out > syst_sens_W1B.out2
+grep -vwE '(LKH|h2)' syst_sens_W4.out > syst_sens_W4.out2
+```
+
+```{r do file for syst_cov_gxe_W1A}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_sens_W1A.do")          # create file with this name
+cat("syst_sens_W1A.out2", "\n")   # line 1: specify the file with parameter estimates (above)
+cat(9, "\n")                         # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 8 8 9 9", "\n")               # line 3: compute prop. of variance due to grm
+cat("R 3 1 2 3 5 6 7 8 8 9 9", "\n")               # line 4: compute prop. of variance due to soc
+cat("R 4 1 2 3 5 6 7 8 8 9 9", "\n")               # line 4: compute prop. of variance due to built
+cat("R 5 1 2 3 4 6 7 8 8 9 9", "\n")               # line 4: compute prop. of variance due to nat
+cat("R 6 1 2 3 4 5 7 8 8 9 9", "\n")               # line 4: compute prop. of variance due to soc_grm.gxe
+cat("R 7 1 2 3 4 5 6 8 8 9 9", "\n")               # line 4: compute prop. of variance due to soc_built.gxe 
+cat("R 1 2 3 4 5 6 7 8 8 9 9", "\n")               # line 4: compute prop. of variance due to error
+cat("C 8 2 3", "\n")                                         # grm~soc
+cat("C 9 3 4", "\n")                                         # soc~built
+sink()
+```
+
+```{r do file for syst_cov_gxe_W1B}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_sens_W1B.do")          # create file with this name
+cat("syst_sens_W1B.out2", "\n")   # line 1: specify the file with parameter estimates (above)
+cat(9, "\n")                         # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 8 8 9 9", "\n")               # line 3: compute prop. of variance due to grm
+cat("R 3 1 2 3 5 6 7 8 8 9 9", "\n")               # line 4: compute prop. of variance due to soc
+cat("R 4 1 2 3 5 6 7 8 8 9 9", "\n")               # line 4: compute prop. of variance due to built
+cat("R 5 1 2 3 4 6 7 8 8 9 9", "\n")               # line 4: compute prop. of variance due to nat
+cat("R 6 1 2 3 4 5 7 8 8 9 9", "\n")               # line 4: compute prop. of variance due to soc_grm.gxe
+cat("R 7 1 2 3 4 5 6 8 8 9 9", "\n")               # line 4: compute prop. of variance due to soc_built.gxe 
+cat("R 1 2 3 4 5 6 7 8 8 9 9", "\n")               # line 4: compute prop. of variance due to error
+cat("C 8 2 3", "\n")                                         # grm~soc
+cat("C 9 3 4", "\n")                                         # soc~built
+sink()
+```
+
+```{r do file for syst_cov_gxe_W4}
+setwd("/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/")
+sink("syst_sens_W4.do")          # create file with this name
+cat("syst_sens_W4.out2", "\n")   # line 1: specify the file with parameter estimates (above)
+cat(9, "\n")                         # line 2: Number of variance & covariance (Ve and Va) components in the file
+cat("R 2 1 3 4 5 6 7 8 8 9 9", "\n")               # line 3: compute prop. of variance due to grm
+cat("R 3 1 2 3 5 6 7 8 8 9 9", "\n")               # line 4: compute prop. of variance due to soc
+cat("R 4 1 2 3 5 6 7 8 8 9 9", "\n")               # line 4: compute prop. of variance due to built
+cat("R 5 1 2 3 4 6 7 8 8 9 9", "\n")               # line 4: compute prop. of variance due to nat
+cat("R 6 1 2 3 4 5 7 8 8 9 9", "\n")               # line 4: compute prop. of variance due to soc_grm.gxe
+cat("R 7 1 2 3 4 5 6 8 8 9 9", "\n")               # line 4: compute prop. of variance due to soc_built.gxe 
+cat("R 1 2 3 4 5 6 7 8 8 9 9", "\n")               # line 4: compute prop. of variance due to error
+cat("C 8 2 3", "\n")                                         # grm~soc
+cat("C 9 3 4", "\n")                                         # soc~built
+sink()
+```
+
+Output using Delta
+
+```{bash output for e_g_gxe_reml}
+cd /project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/
+    
+./../../../mtg2 -delta2 syst_sens_W1A.do > syst_cov_sens_W1A.out3
+./../../../mtg2 -delta2 syst_sens_W1B.do > syst_cov_sens_W1B.out3
+./../../../mtg2 -delta2 syst_sens_W4.do > syst_cov_sens_W4.out3
+```
+
+## Output table 
+
+```{r interaction labels}
+sens_labels <- c("Genetic/Biological systems", "Social environment", "Built environment", "Natural environment",
+                    "Genetic x Social", "Social x Built", 
+                    "Error",
+                    "Total covariance",
+                    "Genetic ~ Social", "Social ~ Built") 
+```
+
+```{r output for dropped domains}
+# W1A
+syst_sens_W1A.output <- extract_delta_output(
+  outcome = "W1A",
+  model_prefix = "syst_cov_sens",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Social environment", "Built environment", "Natural environment", 
+                    rep("Gene-environment interaction", 2), 
+                    "Error")
+)
+
+# add interaction description
+syst_sens_W1A.output <- syst_sens_W1A.output %>%
+  mutate(cor_interaction = sens_labels)
+
+# W1B
+syst_sens_W1B.output <- extract_delta_output(
+  outcome = "W1B",
+  model_prefix = "syst_cov_sens",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Social environment", "Built environment", "Natural environment", 
+                    rep("Gene-environment interaction", 2), 
+                    "Error")
+)
+
+# add interaction description
+syst_sens_W1B.output <- syst_sens_W1B.output %>%
+  mutate(cor_interaction = sens_labels)
+
+# W4
+syst_sens_W4.output <- extract_delta_output(
+  outcome = "W4",
+  model_prefix = "syst_cov_sens",
+  path = "/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/systems/",
+  domain_model = TRUE,
+  domain_labels = c("Genetic/Biological systems", "Social environment", "Built environment", "Natural environment", 
+                    rep("Gene-environment interaction", 2),  
+                    "Error")
+)
+
+# add interaction description
+syst_sens_W4.output <- syst_sens_W4.output %>%
+  mutate(cor_interaction = sens_labels)
+
+# combine
+syst_sens.output <- rbind(syst_sens_W1A.output, syst_sens_W1B.output, syst_sens_W4.output)
+syst_sens.output %>% select(outcome, cor_interaction, input, variance_std, SE, CI_lower, CI_upper, variance_std_tot, P_value, correlation_r, flag_neg_variance, flag_corr_out_of_bounds)
+```
+
+
