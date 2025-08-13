@@ -3,7 +3,7 @@ This repository holds all the scripts for the manuscript: *Illuminating the comp
 
 July, 2025
 
-Currently under review at Nature Mental Health. 
+Currently under review at Nature Human Behaviour. 
 
 **Katherine N Thompson**, Baptiste Couvy-Duchesne, S. Hong Lee, Rafael Geurgas, Yeongmi Jeong, Saranya Arirangan, Saul Newman, Robbee Wedow, and Felix C Tropf
 
