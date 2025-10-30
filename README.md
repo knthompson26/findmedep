@@ -3,7 +3,7 @@ This repository holds all the scripts for the manuscript: *Illuminating the comp
 
 July, 2025
 
-Currently under review at American Journal of Epidemiology. 
+Currently under review at Social Psychiatry and Psychiatric Epidemiology. 
 
 **Katherine N Thompson**, Baptiste Couvy-Duchesne, S. Hong Lee, Rafael Geurgas, Yeongmi Jeong, Saranya Arirangan, Saul Newman, Robbee Wedow, and Felix C Tropf
 
