@@ -9,7 +9,7 @@ Currently under review at Social Psychiatry and Psychiatric Epidemiology.
 
 All code created by [Katherine N Thompson](https://scholar.google.co.uk/citations?user=xD4dn1IAAAAJ&hl=en). 
 
-Pre-registration and pre-print are available on the OSF: https://osf.io/akzhd/
+[Pre-registration](https://osf.io/akzhd/) and [pre-print](https://doi.org/10.31234/osf.io/wf52a_v1). 
 
 ***
 
