@@ -2,6 +2,7 @@
 This repository holds all the scripts for the manuscript: *Illuminating the complex interplay of risk factors for depression within a large-scale US longitudinal cohort*. 
 
 Original: July, 2025
+
 Updated: March 2026
 
 Currently under review at Social Psychiatry and Psychiatric Epidemiology. 
