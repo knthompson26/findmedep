@@ -30,13 +30,13 @@ Analyses for this project were conducted in R (Version 4.0.3). Below names and l
 
 **Research Question 1:** How do prominent individual-level risk factors for depression contribute to concurrent and longitudinal symptom occurrence? 
 
-1. FINDME_missingE_dep_EREML.Rmd. Mixed linear models were conducted on 81 variables on three depression outcomes (W1A, W1B, W4). First, This is done by estimating one random effect for "environmental" data and one random effect for genetic data. Second, we estimate specific random effects for each domain. 
+1. RQ1_W124.Rmd. Mixed linear models were conducted on 81 variables on three depression outcomes (W1, W2, W4). First, This is done by estimating one random effect for "environmental" data and one random effect for genetic data. Second, we estimate specific random effects for each domain. 
                 
 ***
 
 **Research Question 2:** To what extent does the wider environment add to the explanation of depression symptoms?
 
-1. FINDME_missingE_dep_RQ2.Rmd. Mixed linear models were conducted on 162 variables on three depression outcomes (W1A, W1B, W4). This is done by estimating a random effect for each system: biological/genetic systems, psychological systems, social environment, the built environment, and the natural environment.  
+1. RQ2_W124.Rmd. Mixed linear models were conducted on 162 variables on three depression outcomes (W1, W2, W4). This is done by estimating a random effect for each system: biological/genetic systems, psychological systems, social environment, the built environment, and the natural environment.  
 
 
 ***
