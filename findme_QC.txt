@@ -1,0 +1,85 @@
+#!/bin/bash
+# FILENAME:  findme_QC.txt
+
+#SBATCH -A life-cpu 
+#SBATCH --nodes=1                   
+#SBATCH --ntasks=120                 
+#SBATCH --time=120:00:00           
+#SBATCH --partition=cpu
+#SBATCH --job-name=findme_QC
+#SBATCH --output=findme_QC.out  
+#SBATCH --error=findme_QC.err   
+
+# Print the hostname of the compute node on which this job is running.
+/bin/hostname
+
+# Paths
+RAW_DIR="/project/rche/data/datasets/addhealth/clean_progress/genetic_files/gwas_prep/adoldep_2025/qc"
+DIR="/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/qc"
+ARCHIVE="/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/qc/archive"
+OUT="/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR"
+PLINK2="/project/rche/data/datasets/addhealth/scratch/kthompson/findme/plink2"
+PLINK="/project/rche/data/datasets/addhealth/scratch/kthompson/findme/plink"
+LOG="${DIR}/findme_QC_progress.log"
+
+# Create log file
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"
+}
+
+# We use the genetic data files that were imputed by YJ at 0.1 `/project/rche/data/datasets/addhealth/clean_progress/genetic_files/data/imputed/1000g/info_cutoff/0.1/addhealth_imputed_1000g_filtered_clean_full` 
+# SNP IDs were updated and saved in adoldep/qc,  will copy these files into `/project/rche/data/datasets/addhealth/scratch/kthompson/findme/sub_sample/EUR/qc/`
+
+log "JOB STARTED on $(hostname)"
+
+# Copy over imputed files 
+cp "${RAW_DIR}/ahgwas_imputed.QC.READY.EUR.bed" "${DIR}/"
+cp "${RAW_DIR}/ahgwas_imputed.QC.READY.EUR.bim" "${DIR}/"
+cp "${RAW_DIR}/ahgwas_imputed.QC.READY.EUR.fam" "${DIR}/"
+
+log "Finished copying genotype files"
+
+# SNP QC
+"${PLINK2}" \
+   --bfile "${DIR}/ahgwas_imputed.QC.READY.EUR" \
+   --maf 0.01 \
+   --hwe 1e-6 \
+   --geno 0.02 \
+   --mind 0.02 \
+   --make-bed \
+   --out "${DIR}/findme.QC.EUR" 
+   
+log "Finished SNP QC"
+
+# Remove related individuals 
+"${PLINK}" \
+   --bfile "${DIR}/findme.QC.EUR" \
+   --rel-cutoff 0.2 \
+   --make-bed \
+   --out "${DIR}/findme.QC.norel.EUR" 
+   
+log "Finished relatedness filtering"
+
+# Prune data for PCs
+"${PLINK}" \
+   --bfile "${DIR}/findme.QC.norel.EUR" \
+   --indep-pairwise 200 100 0.2 \
+   --out "${DIR}/findme.QC.norel.EUR_pruned"
+   
+log "Finished LD pruning"
+   
+# Create PCs
+"${PLINK}" \
+  --bfile "${DIR}/findme.QC.norel.EUR" \
+  --extract "${DIR}/findme.QC.norel.EUR_pruned.prune.in" \
+  --pca 20 \
+  --out "${DIR}/findme.QC.norel.EUR.pca"
+  
+log "Finished PCA"
+    
+# Copy files to output directory 
+cp "${DIR}/findme.QC.norel.EUR.bed" "${OUT}/findme.READY.bed"
+cp "${DIR}/findme.QC.norel.EUR.bim" "${OUT}/findme.READY.bim"
+cp "${DIR}/findme.QC.norel.EUR.fam" "${OUT}/findme.READY.fam"
+
+log "JOB FINISHED"
